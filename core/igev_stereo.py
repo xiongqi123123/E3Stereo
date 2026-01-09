@@ -222,7 +222,7 @@ class IGEVStereo(nn.Module):
                 inp0_std = inp0.std().item()
                 inp0_min = inp0.min().item()
                 inp0_max = inp0.max().item()
-                tqdm.write(f"[IGEVStereo.forward] inp stat: mean={inp0_mean:.5f}, std={inp0_std:.5f}, min={inp0_min:.5f}, max={inp0_max:.5f}")
+                # tqdm.write(f"[IGEVStereo.forward] inp stat: mean={inp0_mean:.5f}, std={inp0_std:.5f}, min={inp0_min:.5f}, max={inp0_max:.5f}")
             else:
                 tqdm.write("[IGEVStereo.forward] inp_list is empty or not a list")
 
@@ -230,15 +230,14 @@ class IGEVStereo(nn.Module):
             left_edge_std = left_edge.std().item()
             left_edge_min = left_edge.min().item()
             left_edge_max = left_edge.max().item()
-            tqdm.write(f"[IGEVStereo.forward] left_edge stat: mean={left_edge_mean:.5f}, std={left_edge_std:.5f}, min={left_edge_min:.5f}, max={left_edge_max:.5f}")
+            # tqdm.write(f"[IGEVStereo.forward] left_edge stat: mean={left_edge_mean:.5f}, std={left_edge_std:.5f}, min={left_edge_min:.5f}, max={left_edge_max:.5f}")
 
             # === 打印 end ===
 
             # === Edge Fusion: W 方法 (线性变换融合) ===#
-            # 不再需要数值缩放，让1x1卷积学习最优的融合权重
             edge_resized = [F.interpolate(left_edge, size=inp.shape[2:], mode='bilinear') for inp in inp_list]
             fused_list = [torch.cat([inp, edge_r], dim=1) for inp, edge_r in zip(inp_list, edge_resized)]
-            # 通过1x1卷积进行特征融合：(128+1) -> 128，让网络学习edge的重要性
+            # 通过1x1卷积进行特征融合：(128+1) -> 128
             inp_list = [self.edge_fusion_conv[i](fused) for i, fused in enumerate(fused_list)]
             # === End Fusion ===#
 
