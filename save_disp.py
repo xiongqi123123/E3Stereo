@@ -80,7 +80,18 @@ if __name__ == '__main__':
     parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
-    
+    parser.add_argument('--edge_model', type=str, default='../RCF-PyTorch/rcf.pth', help='path to the edge model')
+    parser.add_argument('--edge_context_fusion', action='store_true',
+                        help='fuse edge into context features for GRU input')
+    parser.add_argument('--edge_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_guided_upsample', action='store_true',
+                        help='use edge to guide disparity upsampling for sharper boundaries')
+    parser.add_argument('--edge_upsample_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated', 'mlp'])
+    parser.add_argument('--edge_guided_disp_head', action='store_true')
+    parser.add_argument('--edge_disp_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated', 'mlp'])
     args = parser.parse_args()
 
     demo(args)

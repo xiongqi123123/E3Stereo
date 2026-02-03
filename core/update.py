@@ -129,7 +129,43 @@ class BasicMultiUpdateBlock(nn.Module):
             nn.Conv2d(hidden_dims[2], 32, 3, padding=1),
             nn.ReLU(inplace=True))
 
-    def forward(self, net, inp, corr=None, disp=None, iter04=True, iter08=True, iter16=True, update=True):
+        # ================== Edge-Guided Disp Head ====================##
+        # 使用 Edge 引导 delta_disp 的预测，边缘处可学习更大的更新幅度
+        self.edge_guided_disp_head = getattr(args, 'edge_guided_disp_head', False)
+        self.edge_disp_fusion_mode = getattr(args, 'edge_disp_fusion_mode', 'film')
+        if self.edge_guided_disp_head:
+            hd = hidden_dims[2]  # 128
+            if self.edge_disp_fusion_mode == 'concat':
+                self.edge_disp_fusion = nn.Sequential(
+                    nn.Conv2d(hd + 1, hd, 1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(hd, hd, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                )
+            elif self.edge_disp_fusion_mode == 'film':
+                self.edge_disp_film = nn.Sequential(
+                    nn.Conv2d(1, 16, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(16, hd * 2, 1),
+                )
+            elif self.edge_disp_fusion_mode == 'gated':
+                self.edge_disp_gate = nn.Sequential(
+                    nn.Conv2d(hd + 1, hd, 1),
+                    nn.Sigmoid(),
+                )
+                self.edge_disp_proj = nn.Conv2d(1, hd, 3, padding=1)
+            elif self.edge_disp_fusion_mode == 'mlp':
+                self.edge_disp_mlp = nn.Sequential(
+                    nn.Conv2d(hd + 1, hd * 2, 1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(hd * 2, hd, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                )
+            else:
+                raise ValueError(f"edge_disp_fusion_mode must be concat/film/gated/mlp, got {self.edge_disp_fusion_mode}")
+        # ================== End Edge-Guided Disp Head ====================##
+
+    def forward(self, net, inp, corr=None, disp=None, edge=None, iter04=True, iter08=True, iter16=True, update=True):
 
         if iter16:
             net[2] = self.gru16(net[2], *(inp[2]), pool2x(net[1]))
@@ -148,6 +184,25 @@ class BasicMultiUpdateBlock(nn.Module):
         if not update:
             return net
 
-        delta_disp = self.disp_head(net[0])
+        # ================== Edge-Guided Disp Head ====================##
+        net0 = net[0]
+        if self.edge_guided_disp_head and edge is not None:
+            edge_resized = F.interpolate(edge, size=net0.shape[2:], mode='bilinear', align_corners=False)
+            if self.edge_disp_fusion_mode == 'concat':
+                net0_with_edge = torch.cat([net0, edge_resized], dim=1)
+                net0 = net0 + self.edge_disp_fusion(net0_with_edge)
+            elif self.edge_disp_fusion_mode == 'film':
+                gamma, beta = self.edge_disp_film(edge_resized).chunk(2, dim=1)
+                net0 = (1 + gamma) * net0 + beta
+            elif self.edge_disp_fusion_mode == 'gated':
+                gate = self.edge_disp_gate(torch.cat([net0, edge_resized], dim=1))
+                edge_proj = self.edge_disp_proj(edge_resized)
+                net0 = gate * net0 + (1 - gate) * edge_proj
+            elif self.edge_disp_fusion_mode == 'mlp':
+                net0_with_edge = torch.cat([net0, edge_resized], dim=1)
+                net0 = net0 + self.edge_disp_mlp(net0_with_edge)
+        # ================== End Edge-Guided Disp Head ====================##
+
+        delta_disp = self.disp_head(net0)
         mask_feat_4 = self.mask_feat_4(net[0])
         return net, mask_feat_4, delta_disp

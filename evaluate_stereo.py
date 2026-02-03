@@ -160,8 +160,14 @@ def validate_sceneflow(model, iters=32, mixed_prec=False):
 
     epe = np.mean(epe_list)
     d1 = 100 * np.mean(out_list)
-
-    f = open('test.txt', 'a')
+    if args.edge_context_fusion:
+        f = open(f'{args.edge_fusion_mode}-context-test.txt', 'a')
+    elif args.edge_guided_upsample:
+        f = open(f'{args.edge_upsample_fusion_mode}-upsample-test.txt', 'a')
+    elif args.edge_guided_disp_head:
+        f = open(f'{args.edge_disp_fusion_mode}-disp-head-test.txt', 'a')
+    else:
+        f = open('test.txt', 'a')
     f.write("Validation Scene Flow: %f, %f\n" % (epe, d1))
 
     print("Validation Scene Flow: %f, %f" % (epe, d1))
@@ -229,6 +235,19 @@ if __name__ == '__main__':
     parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
+    parser.add_argument('--edge_model', type=str, default='../RCF-PyTorch/rcf.pth', help='path to the edge model')
+    parser.add_argument('--edge_context_fusion', action='store_true',
+                        help='fuse edge into context features for GRU input')
+    parser.add_argument('--edge_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'],
+                        help='edge-context fusion: concat/film/gated')
+    parser.add_argument('--edge_guided_upsample', action='store_true',
+                        help='use edge to guide disparity upsampling for sharper boundaries')
+    parser.add_argument('--edge_upsample_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated', 'mlp'])
+    parser.add_argument('--edge_guided_disp_head', action='store_true')
+    parser.add_argument('--edge_disp_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated', 'mlp'])
     args = parser.parse_args()
 
     model = torch.nn.DataParallel(IGEVStereo(args), device_ids=[0])

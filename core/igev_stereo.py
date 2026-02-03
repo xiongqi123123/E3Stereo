@@ -9,7 +9,6 @@ from core.rcf_models import RCF
 import time
 from tqdm import tqdm
 
-
 try:
     autocast = torch.cuda.amp.autocast
 except:
@@ -100,24 +99,50 @@ class IGEVStereo(nn.Module):
         self.cnet = MultiBasicEncoder(output_dim=[args.hidden_dims, context_dims], norm_fn="batch", downsample=args.n_downsample)
         self.update_block = BasicMultiUpdateBlock(self.args, hidden_dims=args.hidden_dims)
 
-        # ================== Edge Fusion Convs (W 方法: 线性变换融合) ====================##
-        # 先拼接edge，再通过1x1卷积融合，比硬拼接更智能
-        self.edge_fusion_conv = nn.ModuleList([
-            nn.Conv2d(context_dims[i] + 1, context_dims[i], 1)  # 1x1 conv: (128+1) -> 128
-            for i in range(self.args.n_gru_layers)
-        ])
-        # ================== End Edge Fusion ====================##
+        # ================== Edge Context Fusion ====================##
+        # 多模态融合：将 Edge 与 Context 融合，支持 concat / film / gated 三种模式
+        # concat: Hard 融合，直接拼接后 1x1 conv
+        # film:   Soft 融合，FiLM (Feature-wise Linear Modulation)，edge 生成 γ,β 调制 context
+        # gated:  Soft 融合，门控机制，学习 edge 与 context 的自适应权重
+        self.edge_context_fusion = getattr(args, 'edge_context_fusion', False)
+        self.edge_fusion_mode = getattr(args, 'edge_fusion_mode', 'film')
+        if self.edge_context_fusion:
+            if self.edge_fusion_mode == 'concat':
+                self.edge_fusion_conv = nn.ModuleList([
+                    nn.Conv2d(context_dims[i] + 1, context_dims[i], kernel_size=1)
+                    for i in range(self.args.n_gru_layers)
+                ])
+            elif self.edge_fusion_mode == 'film':
+                # FiLM: out = (1 + γ) * context + β, γ/β 由 edge 生成，实现条件调制
+                self.edge_film_proj = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(1, context_dims[i] // 4, 3, padding=1),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(context_dims[i] // 4, context_dims[i] * 2, 1),  # γ 和 β 各 C 维
+                    )
+                    for i in range(self.args.n_gru_layers)
+                ])
+            elif self.edge_fusion_mode == 'gated':
+                # Gated: gate = σ(f(concat)), out = gate * context + (1-gate) * edge_proj
+                self.edge_gate_conv = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(context_dims[i] + 1, context_dims[i], 1),
+                        nn.Sigmoid(),
+                    )
+                    for i in range(self.args.n_gru_layers)
+                ])
+                self.edge_proj_conv = nn.ModuleList([
+                    nn.Conv2d(1, context_dims[i], 3, padding=1)
+                    for i in range(self.args.n_gru_layers)
+                ])
+            else:
+                raise ValueError(f"edge_fusion_mode must be one of concat/film/gated, got {self.edge_fusion_mode}")
+        # ================== End Edge Context Fusion ====================##
 
         # ================== Context ZQR Convs ====================##
         self.context_zqr_convs = nn.ModuleList([nn.Conv2d(context_dims[i], args.hidden_dims[i]*3, 3, padding=3//2) for i in range(self.args.n_gru_layers)])
         # ================== End Context ZQR ====================##
         self.feature = Feature()
-
-        self.edge = RCF()
-        self.edge.load_state_dict(torch.load(args.edge_model, map_location='cpu'), strict=False)
-        for param in self.edge.parameters():
-            param.requires_grad = False
-        self.edge.eval()
 
         self.stem_2 = nn.Sequential(
             BasicConv_IN(3, 32, kernel_size=3, stride=2, padding=1),
@@ -141,6 +166,42 @@ class IGEVStereo(nn.Module):
         self.spx_2_gru = Conv2x(32, 32, True)
         self.spx_gru = nn.Sequential(nn.ConvTranspose2d(2*32, 9, kernel_size=4, stride=2, padding=1),)
 
+        # ================== Edge-Guided Upsampling ====================##
+        # 使用 Edge 引导视差上采样，支持多种融合方式：concat / film / gated / mlp
+        self.edge_guided_upsample = getattr(args, 'edge_guided_upsample', False)
+        self.edge_upsample_fusion_mode = getattr(args, 'edge_upsample_fusion_mode', 'film')
+        if self.edge_guided_upsample:
+            spx_channels = 64
+            if self.edge_upsample_fusion_mode == 'concat':
+                self.edge_upsample_fusion = nn.Sequential(
+                    nn.Conv2d(spx_channels + 1, spx_channels, 1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(spx_channels, spx_channels, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                )
+            elif self.edge_upsample_fusion_mode == 'film':
+                self.edge_upsample_film = nn.Sequential(
+                    nn.Conv2d(1, 16, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(16, spx_channels * 2, 1),
+                )
+            elif self.edge_upsample_fusion_mode == 'gated':
+                self.edge_upsample_gate = nn.Sequential(
+                    nn.Conv2d(spx_channels + 1, spx_channels, 1),
+                    nn.Sigmoid(),
+                )
+                self.edge_upsample_proj = nn.Conv2d(1, spx_channels, 3, padding=1)
+            elif self.edge_upsample_fusion_mode == 'mlp':
+                self.edge_upsample_mlp = nn.Sequential(
+                    nn.Conv2d(spx_channels + 1, spx_channels * 2, 1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(spx_channels * 2, spx_channels, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                )
+            else:
+                raise ValueError(f"edge_upsample_fusion_mode must be concat/film/gated/mlp, got {self.edge_upsample_fusion_mode}")
+        # ================== End Edge-Guided Upsampling ====================##
+
         self.conv = BasicConv_IN(96, 96, kernel_size=3, padding=1, stride=1)
         self.desc = nn.Conv2d(96, 96, kernel_size=1, padding=0, stride=1)
 
@@ -149,15 +210,58 @@ class IGEVStereo(nn.Module):
         self.cost_agg = hourglass(8)
         self.classifier = nn.Conv3d(8, 1, 3, 1, 1, bias=False)
 
+        # ================== Edge Branch ====================##
+        # 仅当任一 Edge 相关功能启用时加载 Edge 分支，否则与原始 IGEV 完全一致
+        self.edge_guided_disp_head = getattr(args, 'edge_guided_disp_head', False)
+        self._use_edge = self.edge_context_fusion or self.edge_guided_upsample or self.edge_guided_disp_head
+        if self._use_edge:
+            edge_model_path = getattr(args, 'edge_model', None)
+            if edge_model_path is None:
+                raise ValueError("edge_model is required when edge_context_fusion or edge_guided_upsample is enabled")
+            self.edge = RCF()
+            self.edge.load_state_dict(torch.load(edge_model_path, map_location='cpu'), strict=False)
+            for param in self.edge.parameters():
+                param.requires_grad = False
+            self.edge.eval()
+            self.edge_log_scale = nn.Parameter(torch.tensor(-1.0))
+        # ================== End Edge Branch ====================##
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
-    def upsample_disp(self, disp, mask_feat_4, stem_2x):
-
+    def upsample_disp(self, disp, mask_feat_4, stem_2x, left_edge=None):
+        """
+        将 1/4 分辨率视差上采样到全分辨率。
+        当 edge_guided_upsample 启用时，使用 left_edge 引导上采样权重，在物体边界处保持锐利。
+        """
         with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
             xspx = self.spx_2_gru(mask_feat_4, stem_2x)
+
+            # ================== Edge-Guided Upsampling ====================##
+            if self.edge_guided_upsample and left_edge is not None:
+                edge_resized = F.interpolate(
+                    left_edge,
+                    size=xspx.shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if self.edge_upsample_fusion_mode == 'concat':
+                    xspx_with_edge = torch.cat([xspx, edge_resized], dim=1)
+                    xspx = xspx + self.edge_upsample_fusion(xspx_with_edge)
+                elif self.edge_upsample_fusion_mode == 'film':
+                    gamma, beta = self.edge_upsample_film(edge_resized).chunk(2, dim=1)
+                    xspx = (1 + gamma) * xspx + beta
+                elif self.edge_upsample_fusion_mode == 'gated':
+                    gate = self.edge_upsample_gate(torch.cat([xspx, edge_resized], dim=1))
+                    edge_proj = self.edge_upsample_proj(edge_resized)
+                    xspx = gate * xspx + (1 - gate) * edge_proj
+                elif self.edge_upsample_fusion_mode == 'mlp':
+                    xspx_with_edge = torch.cat([xspx, edge_resized], dim=1)
+                    xspx = xspx + self.edge_upsample_mlp(xspx_with_edge)
+            # ================== End Edge-Guided Upsampling ====================##
+
             spx_pred = self.spx_gru(xspx)
             spx_pred = F.softmax(spx_pred, 1)
             up_disp = context_upsample(disp*4., spx_pred).unsqueeze(1)
@@ -168,16 +272,17 @@ class IGEVStereo(nn.Module):
     def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
         """ Estimate disparity between pair of frames """
 
-        ## =========== Edge (forward内部已做预处理: RGB->BGR + 减均值) ====================##
-        with torch.no_grad():
-            left_edge = self.edge(image1)[-1]  # [B, 1, H, W], [0, 1]
-            # 将 edge 缩放到与 inp 相似的数值范围 (inp max ~10, edge max ~1)
-            left_edge = left_edge * 5.0  # 缩放因子，使 edge 的有效范围变为 [0, 5]
-        ## =========== Edge ====================##
+        # ================== Edge ====================##
+        left_edge = None
+        if self._use_edge:
+            with torch.no_grad():
+                left_edge_rcf = self.edge(image1)[-1]
+            edge_scale = F.softplus(self.edge_log_scale)
+            left_edge = left_edge_rcf * edge_scale
+        # ================== End Edge ====================##
 
         image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
         image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
-
         with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
             features_left = self.feature(image1)
             features_right = self.feature(image2)
@@ -204,6 +309,25 @@ class IGEVStereo(nn.Module):
             if not test_mode:
                 xspx = self.spx_4(features_left[0])
                 xspx = self.spx_2(xspx, stem_2x)
+                # ================== Edge-Guided Upsampling (init_disp) ====================##
+                if self.edge_guided_upsample and left_edge is not None:
+                    edge_resized = F.interpolate(
+                        left_edge, size=xspx.shape[2:], mode='bilinear', align_corners=False
+                    )
+                    if self.edge_upsample_fusion_mode == 'concat':
+                        xspx_with_edge = torch.cat([xspx, edge_resized], dim=1)
+                        xspx = xspx + self.edge_upsample_fusion(xspx_with_edge)
+                    elif self.edge_upsample_fusion_mode == 'film':
+                        gamma, beta = self.edge_upsample_film(edge_resized).chunk(2, dim=1)
+                        xspx = (1 + gamma) * xspx + beta
+                    elif self.edge_upsample_fusion_mode == 'gated':
+                        gate = self.edge_upsample_gate(torch.cat([xspx, edge_resized], dim=1))
+                        edge_proj = self.edge_upsample_proj(edge_resized)
+                        xspx = gate * xspx + (1 - gate) * edge_proj
+                    elif self.edge_upsample_fusion_mode == 'mlp':
+                        xspx_with_edge = torch.cat([xspx, edge_resized], dim=1)
+                        xspx = xspx + self.edge_upsample_mlp(xspx_with_edge)
+                # ================== End Edge-Guided Upsampling (init_disp) ====================##
                 spx_pred = self.spx(xspx)
                 spx_pred = F.softmax(spx_pred, 1)
 
@@ -211,37 +335,35 @@ class IGEVStereo(nn.Module):
             net_list = [torch.tanh(x[0]) for x in cnet_list]
             inp_list = [torch.relu(x[1]) for x in cnet_list]
 
-            # === 打印 inp 和 edge 的统计量 ===
-            # inp_list: list of tensors, left_edge: tensor (already on correct device)
-            # We print mean/std/min/max of the FIRST inp (as representative) and also left_edge
-            # Stats for inp (channel, H, W): get the first one in inp_list
+            # ================== Edge Context Fusion ====================##
+            if self.edge_context_fusion and left_edge is not None:
+                fused_inp_list = []
+                for i in range(self.args.n_gru_layers):
+                    edge_resized = F.interpolate(
+                        left_edge,
+                        size=inp_list[i].shape[2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    ctx = inp_list[i]
+                    if self.edge_fusion_mode == 'concat':
+                        inp_with_edge = torch.cat([ctx, edge_resized], dim=1)
+                        fused_inp = self.edge_fusion_conv[i](inp_with_edge)
+                    elif self.edge_fusion_mode == 'film':
+                        # FiLM: out = (1 + γ) * context + β
+                        film_params = self.edge_film_proj[i](edge_resized)
+                        gamma, beta = film_params.chunk(2, dim=1)
+                        fused_inp = (1 + gamma) * ctx + beta
+                    elif self.edge_fusion_mode == 'gated':
+                        # Gated: out = gate * context + (1 - gate) * edge_proj
+                        gate = self.edge_gate_conv[i](torch.cat([ctx, edge_resized], dim=1))
+                        edge_proj = self.edge_proj_conv[i](edge_resized)
+                        fused_inp = gate * ctx + (1 - gate) * edge_proj
+                    fused_inp_list.append(fused_inp)
+                inp_list = fused_inp_list
+            # ================== End Edge Context Fusion ====================##
 
-            if isinstance(inp_list, list) and len(inp_list) > 0:
-                inp0 = inp_list[0]
-                inp0_mean = inp0.mean().item()
-                inp0_std = inp0.std().item()
-                inp0_min = inp0.min().item()
-                inp0_max = inp0.max().item()
-                # tqdm.write(f"[IGEVStereo.forward] inp stat: mean={inp0_mean:.5f}, std={inp0_std:.5f}, min={inp0_min:.5f}, max={inp0_max:.5f}")
-            else:
-                tqdm.write("[IGEVStereo.forward] inp_list is empty or not a list")
-
-            left_edge_mean = left_edge.mean().item()
-            left_edge_std = left_edge.std().item()
-            left_edge_min = left_edge.min().item()
-            left_edge_max = left_edge.max().item()
-            # tqdm.write(f"[IGEVStereo.forward] left_edge stat: mean={left_edge_mean:.5f}, std={left_edge_std:.5f}, min={left_edge_min:.5f}, max={left_edge_max:.5f}")
-
-            # === 打印 end ===
-
-            # === Edge Fusion: W 方法 (线性变换融合) ===#
-            edge_resized = [F.interpolate(left_edge, size=inp.shape[2:], mode='bilinear') for inp in inp_list]
-            fused_list = [torch.cat([inp, edge_r], dim=1) for inp, edge_r in zip(inp_list, edge_resized)]
-            # 通过1x1卷积进行特征融合：(128+1) -> 128
-            inp_list = [self.edge_fusion_conv[i](fused) for i, fused in enumerate(fused_list)]
-            # === End Fusion ===#
-
-            inp_list = [list(conv(i).split(split_size=conv.out_channels//3, dim=1)) for i,conv in zip(inp_list, self.context_zqr_convs)]
+            inp_list = [list(conv(i).split(split_size=conv.out_channels//3, dim=1)) for i, conv in zip(inp_list, self.context_zqr_convs)]
 
 
         geo_block = Combined_Geo_Encoding_Volume
@@ -256,14 +378,21 @@ class IGEVStereo(nn.Module):
             disp = disp.detach()
             geo_feat = geo_fn(disp, coords)
             with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
-                net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, iter16=self.args.n_gru_layers==3, iter08=self.args.n_gru_layers>=2)
+                net_list, mask_feat_4, delta_disp = self.update_block(
+                    net_list, inp_list, geo_feat, disp,
+                    edge=left_edge if self.edge_guided_disp_head else None,
+                    iter16=self.args.n_gru_layers==3, iter08=self.args.n_gru_layers>=2
+                )
 
             disp = disp + delta_disp
             if test_mode and itr < iters-1:
                 continue
 
             # upsample predictions
-            disp_up = self.upsample_disp(disp, mask_feat_4, stem_2x)
+            disp_up = self.upsample_disp(
+                disp, mask_feat_4, stem_2x,
+                left_edge=left_edge if self.edge_guided_upsample else None
+            )
             disp_preds.append(disp_up)
 
         if test_mode:
