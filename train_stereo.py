@@ -463,7 +463,7 @@ def train(args):
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
                 if 'sceneflow' in args.train_datasets:
-                    results = validate_sceneflow(model.module, iters=args.valid_iters)
+                    results = validate_sceneflow(model.module, iters=args.valid_iters, args=args)
                 elif 'kitti' in args.train_datasets:
                     results = validate_kitti(model.module, iters=args.valid_iters)
                 else: 

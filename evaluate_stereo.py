@@ -120,7 +120,7 @@ def validate_kitti(model, iters=32, mixed_prec=False):
 
 
 @torch.no_grad()
-def validate_sceneflow(model, iters=32, mixed_prec=False):
+def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
     """ Peform validation using the Scene Flow (TEST) split """
     model.eval()
     val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True)
@@ -160,12 +160,12 @@ def validate_sceneflow(model, iters=32, mixed_prec=False):
 
     epe = np.mean(epe_list)
     d1 = 100 * np.mean(out_list)
-    if args.edge_context_fusion:
-        f = open(f'{args.edge_fusion_mode}-context-test.txt', 'a')
-    elif args.edge_guided_upsample:
-        f = open(f'{args.edge_upsample_fusion_mode}-upsample-test.txt', 'a')
-    elif args.edge_guided_disp_head:
-        f = open(f'{args.edge_disp_fusion_mode}-disp-head-test.txt', 'a')
+    if args is not None and getattr(args, 'edge_context_fusion', False):
+        f = open(f'{getattr(args, "edge_fusion_mode", "film")}-context-test.txt', 'a')
+    elif args is not None and getattr(args, 'edge_guided_upsample', False):
+        f = open(f'{getattr(args, "edge_upsample_fusion_mode", "film")}-upsample-test.txt', 'a')
+    elif args is not None and getattr(args, 'edge_guided_disp_head', False):
+        f = open(f'{getattr(args, "edge_disp_fusion_mode", "film")}-disp-head-test.txt', 'a')
     else:
         f = open('test.txt', 'a')
     f.write("Validation Scene Flow: %f, %f\n" % (epe, d1))
@@ -277,4 +277,4 @@ if __name__ == '__main__':
         validate_middlebury(model, iters=args.valid_iters, split=args.dataset[-1], mixed_prec=args.mixed_precision)
 
     elif args.dataset == 'sceneflow':
-        validate_sceneflow(model, iters=args.valid_iters, mixed_prec=args.mixed_precision)
+        validate_sceneflow(model, iters=args.valid_iters, mixed_prec=args.mixed_precision, args=args)
