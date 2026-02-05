@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@connect.westc.gpuhub.com:45128 password (7)" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="root@connect.westc.gpuhub.com:45128 password (6)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/stereo" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@connect.westc.gpuhub.com:45128 password (7)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/stereo" local="$PROJECT_DIR$" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath path="/root/autodl-tmp/stereo/dataset_cache" />
+            <excludedPath path="/root/autodl-tmp/stereo/model_cache" />
+            <excludedPath path="/root/autodl-tmp/stereo/checkpoints" />
+            <excludedPath path="/root/autodl-tmp/stereo/.claude" />
+            <excludedPath path="/root/autodl-tmp/stereo/__pycache__" />
+            <excludedPath local="true" path="$PROJECT_DIR$/Sampler.tar.gz" />
+            <excludedPath local="true" path="$PROJECT_DIR$/checkpoints" />
+            <excludedPath local="true" path="$PROJECT_DIR$/dataset_cache" />
+            <excludedPath local="true" path="$PROJECT_DIR$/src/checkpoints" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
