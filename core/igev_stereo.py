@@ -93,7 +93,9 @@ class IGEVStereo(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        
+        # Edge 来源: 'rcf' 使用 RCF 分支在线预测; 'gt' 使用外部读取的 gt edge (如 gtedge.py 预生成)
+        self.edge_source = getattr(args, 'edge_source', 'rcf')
+
         context_dims = args.hidden_dims
 
         self.cnet = MultiBasicEncoder(output_dim=[args.hidden_dims, context_dims], norm_fn="batch", downsample=args.n_downsample)
@@ -207,6 +209,34 @@ class IGEVStereo(nn.Module):
 
         self.corr_stem = BasicConv(8, 8, is_3d=True, kernel_size=3, stride=1, padding=1)
         self.corr_feature_att = FeatureAtt(8, 96)
+        # ================== Edge-Guided GWC ====================##
+        # 将 Edge 注入 corr_feature_att 的 feat，使 GWC 的 attention 在边界处更具判别力
+        # features[0] 通道数为 96，与 corr_feature_att 的 feat_chan 一致
+        self.edge_guided_gwc = getattr(args, 'edge_guided_gwc', False)
+        self.edge_gwc_fusion_mode = getattr(args, 'edge_gwc_fusion_mode', 'film')
+        gwc_feat_chan = 96
+        if self.edge_guided_gwc:
+            if self.edge_gwc_fusion_mode == 'concat':
+                self.edge_gwc_fusion = nn.Sequential(
+                    nn.Conv2d(gwc_feat_chan + 1, gwc_feat_chan, 1),
+                    nn.ReLU(inplace=True),
+                )
+            elif self.edge_gwc_fusion_mode == 'film':
+                self.edge_gwc_film = nn.Sequential(
+                    nn.Conv2d(1, 24, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(24, gwc_feat_chan * 2, 1),
+                )
+            elif self.edge_gwc_fusion_mode == 'gated':
+                self.edge_gwc_gate = nn.Sequential(
+                    nn.Conv2d(gwc_feat_chan + 1, gwc_feat_chan, 1),
+                    nn.Sigmoid(),
+                )
+                self.edge_gwc_proj = nn.Conv2d(1, gwc_feat_chan, 3, padding=1)
+            else:
+                raise ValueError(f"edge_gwc_fusion_mode must be concat/film/gated, got {self.edge_gwc_fusion_mode}")
+        # ================== End Edge-Guided GWC ====================##
+
         self.cost_agg = hourglass(8)
         self.classifier = nn.Conv3d(8, 1, 3, 1, 1, bias=False)
 
@@ -253,17 +283,64 @@ class IGEVStereo(nn.Module):
         # ================== Edge Branch ====================##
         # 仅当任一 Edge 相关功能启用时加载 Edge 分支，否则与原始 IGEV 完全一致
         self.edge_guided_disp_head = getattr(args, 'edge_guided_disp_head', False)
-        self._use_edge = (self.edge_context_fusion or self.edge_guided_upsample or
-                         self.edge_guided_disp_head or self.edge_guided_cost_agg)
+        self.edge_motion_encoder = getattr(args, 'edge_motion_encoder', False)
+        # ================== Edge-Guided Refinement ====================##
+        # 后处理：用 Edge 引导视差 refinement，在边界处锐化、平坦区可学习平滑
+        # 残差形式 disp_refined = disp + f(disp, edge)，支持 concat / film / gated
+        # boundary_only: 仅在边界区域施加 refinement，disp_refined = disp + mask(edge) * residual
+        self.edge_guided_refinement = getattr(args, 'edge_guided_refinement', False)
+        self.boundary_only_refinement = getattr(args, 'boundary_only_refinement', False)
+        self._refinement_enabled = self.edge_guided_refinement or self.boundary_only_refinement
+        self.edge_refinement_fusion_mode = getattr(args, 'edge_refinement_fusion_mode', 'film')
+        if self._refinement_enabled:
+            if self.edge_refinement_fusion_mode == 'concat':
+                self.edge_refinement_conv = nn.Sequential(
+                    nn.Conv2d(2, 32, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(32, 32, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(32, 1, 3, padding=1),
+                )
+            elif self.edge_refinement_fusion_mode == 'film':
+                self.edge_refinement_film = nn.Sequential(
+                    nn.Conv2d(1, 16, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(16, 2, 1),
+                )
+            elif self.edge_refinement_fusion_mode == 'gated':
+                self.edge_refinement_gate = nn.Sequential(
+                    nn.Conv2d(2, 32, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(32, 2, 1),
+                )
+            else:
+                raise ValueError(f"edge_refinement_fusion_mode must be concat/film/gated, got {self.edge_refinement_fusion_mode}")
+        # ================== End Edge-Guided Refinement ====================##
+
+        self.edge_aware_smoothness = getattr(args, 'edge_aware_smoothness', False)
+        self.edge_weight_epe = getattr(args, 'edge_weight_epe_weight', 0.0) > 0
+        self._use_edge = (
+            self.edge_context_fusion
+            or self.edge_guided_upsample
+            or self.edge_guided_disp_head
+            or self.edge_guided_cost_agg
+            or self.edge_guided_gwc
+            or self.edge_motion_encoder
+            or self._refinement_enabled
+            or self.edge_aware_smoothness
+            or self.edge_weight_epe
+        )
         if self._use_edge:
-            edge_model_path = getattr(args, 'edge_model', None)
-            if edge_model_path is None:
-                raise ValueError("edge_model is required when any edge_* feature is enabled")
-            self.edge = RCF()
-            self.edge.load_state_dict(torch.load(edge_model_path, map_location='cpu'), strict=False)
-            for param in self.edge.parameters():
-                param.requires_grad = False
-            self.edge.eval()
+            if self.edge_source == 'rcf':
+                edge_model_path = getattr(args, 'edge_model', None)
+                if edge_model_path is None:
+                    raise ValueError("edge_model is required when edge_source='rcf' and any edge_* feature is enabled")
+                self.edge = RCF()
+                self.edge.load_state_dict(torch.load(edge_model_path, map_location='cpu'), strict=False)
+                for param in self.edge.parameters():
+                    param.requires_grad = False
+                self.edge.eval()
+            # 学习一个 log-scale，对 edge 强度做自适应缩放；无论 rcf 还是 gt 都共享这一个尺度
             self.edge_log_scale = nn.Parameter(torch.tensor(-1.0))
         # ================== End Edge Branch ====================##
 
@@ -309,17 +386,57 @@ class IGEVStereo(nn.Module):
 
         return up_disp
 
+    def refine_disp(self, disp, left_edge):
+        """
+        Edge-guided refinement: 用 edge 引导视差后处理，在边界处锐化、平坦区可学习平滑。
+        残差形式 disp_refined = disp + f(disp, edge)。
+        boundary_only 时：仅在边界施加 refinement，disp_refined = disp + mask(edge) * residual。
+        """
+        if not self._refinement_enabled or left_edge is None:
+            return disp
+        edge_resized = F.interpolate(
+            left_edge, size=disp.shape[2:], mode='bilinear', align_corners=False
+        )
+        with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+            if self.edge_refinement_fusion_mode == 'concat':
+                disp_edge = torch.cat([disp, edge_resized], dim=1)
+                residual = self.edge_refinement_conv(disp_edge)
+            elif self.edge_refinement_fusion_mode == 'film':
+                gamma, beta = self.edge_refinement_film(edge_resized).chunk(2, dim=1)
+                residual = gamma * disp + beta
+            elif self.edge_refinement_fusion_mode == 'gated':
+                disp_edge = torch.cat([disp, edge_resized], dim=1)
+                gate, residual = self.edge_refinement_gate(disp_edge).chunk(2, dim=1)
+                residual = torch.sigmoid(gate) * residual
+            else:
+                return disp
+            # boundary_only: 仅边界施加 residual，mask = edge (clamp 到 [0,1])
+            if self.boundary_only_refinement:
+                mask = edge_resized.clamp(0.0, 1.0)
+                residual = mask * residual
+            return disp + residual
 
-    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
+    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False, left_edge=None):
         """ Estimate disparity between pair of frames """
 
         # ================== Edge ====================##
-        left_edge = None
+        # left_edge 输入优先级:
+        #   1) 当 edge_source='gt' 时, 期望调用者传入 left_edge (来自 gtedge 预生成);
+        #   2) 当 edge_source='rcf' 时, 在线通过 RCF 预测.
         if self._use_edge:
-            with torch.no_grad():
-                left_edge_rcf = self.edge(image1)[-1]
+            if self.edge_source == 'gt':
+                if left_edge is None:
+                    raise ValueError("left_edge tensor must be provided when edge_source='gt'")
+                left_edge_raw = left_edge
+            else:  # 'rcf'
+                with torch.no_grad():
+                    left_edge_raw = self.edge(image1)[-1]
+
+            # 自适应缩放 edge 强度
             edge_scale = F.softplus(self.edge_log_scale)
-            left_edge = left_edge_rcf * edge_scale
+            left_edge = left_edge_raw * edge_scale
+        else:
+            left_edge = None
         # ================== End Edge ====================##
 
         image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
@@ -338,7 +455,25 @@ class IGEVStereo(nn.Module):
             match_right = self.desc(self.conv(features_right[0]))
             gwc_volume = build_gwc_volume(match_left, match_right, self.args.max_disp//4, 8)
             gwc_volume = self.corr_stem(gwc_volume)
-            gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
+            # ================== Edge-Guided GWC ====================##
+            # 将 left_edge 注入 features[0]，使 corr_feature_att 的 attention 在边界处更优
+            gwc_feat = features_left[0]
+            if self.edge_guided_gwc and left_edge is not None:
+                edge_resized = F.interpolate(
+                    left_edge, size=gwc_feat.shape[2:], mode='bilinear', align_corners=False
+                )
+                if self.edge_gwc_fusion_mode == 'concat':
+                    feat_with_edge = torch.cat([gwc_feat, edge_resized], dim=1)
+                    gwc_feat = gwc_feat + self.edge_gwc_fusion(feat_with_edge)
+                elif self.edge_gwc_fusion_mode == 'film':
+                    gamma, beta = self.edge_gwc_film(edge_resized).chunk(2, dim=1)
+                    gwc_feat = (1 + gamma) * gwc_feat + beta
+                elif self.edge_gwc_fusion_mode == 'gated':
+                    gate = self.edge_gwc_gate(torch.cat([gwc_feat, edge_resized], dim=1))
+                    edge_proj = self.edge_gwc_proj(edge_resized)
+                    gwc_feat = gate * gwc_feat + (1 - gate) * edge_proj
+            gwc_volume = self.corr_feature_att(gwc_volume, gwc_feat)
+            # ================== End Edge-Guided GWC ====================##
             # ================== Edge-Guided Cost Aggregation ====================##
             # 将 left_edge 注入 features[1/2/3]，使 Hourglass 的 FeatureAtt 在边界处产生更优的 init_disp
             cost_agg_features = list(features_left)
@@ -443,7 +578,7 @@ class IGEVStereo(nn.Module):
             with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
                 net_list, mask_feat_4, delta_disp = self.update_block(
                     net_list, inp_list, geo_feat, disp,
-                    edge=left_edge if self.edge_guided_disp_head else None,
+                    edge=left_edge if (self.edge_guided_disp_head or self.edge_motion_encoder) else None,
                     iter16=self.args.n_gru_layers==3, iter08=self.args.n_gru_layers>=2
                 )
 
@@ -456,10 +591,12 @@ class IGEVStereo(nn.Module):
                 disp, mask_feat_4, stem_2x,
                 left_edge=left_edge if self.edge_guided_upsample else None
             )
+            disp_up = self.refine_disp(disp_up, left_edge)
             disp_preds.append(disp_up)
 
         if test_mode:
-            return disp_up
+            return disp_preds[-1]
 
         init_disp = context_upsample(init_disp*4., spx_pred.float()).unsqueeze(1)
-        return init_disp, disp_preds
+        init_disp = self.refine_disp(init_disp, left_edge)
+        return init_disp, disp_preds, left_edge

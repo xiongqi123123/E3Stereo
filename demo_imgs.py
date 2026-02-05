@@ -94,6 +94,16 @@ if __name__ == '__main__':
     parser.add_argument('--edge_guided_cost_agg', action='store_true')
     parser.add_argument('--edge_cost_agg_fusion_mode', type=str, default='film',
                         choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_guided_gwc', action='store_true')
+    parser.add_argument('--edge_gwc_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_motion_encoder', action='store_true')
+    parser.add_argument('--edge_motion_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_guided_refinement', action='store_true')
+    parser.add_argument('--boundary_only_refinement', action='store_true')
+    parser.add_argument('--edge_refinement_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
     args = parser.parse_args()
 
     Path(args.output_directory).mkdir(exist_ok=True, parents=True)

@@ -11,13 +11,14 @@ import random
 from pathlib import Path
 from glob import glob
 import os.path as osp
+import cv2
 
 from core.utils import frame_utils
 from core.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
 
 
 class StereoDataset(data.Dataset):
-    def __init__(self, aug_params=None, sparse=False, reader=None):
+    def __init__(self, aug_params=None, sparse=False, reader=None, edge_source='rcf'):
         self.augmentor = None
         self.sparse = sparse
         self.img_pad = aug_params.pop("img_pad", None) if aug_params is not None else None
@@ -32,6 +33,7 @@ class StereoDataset(data.Dataset):
         else:
             self.disparity_reader = reader        
 
+        self.edge_source = edge_source  # 'rcf' or 'gt'
         self.is_test = False
         self.init_seed = False
         self.flow_list = []
@@ -84,12 +86,38 @@ class StereoDataset(data.Dataset):
             img1 = img1[..., :3]
             img2 = img2[..., :3]
 
+        # 加载 GT edge（如果需要）
+        edge = None
+        if self.edge_source == 'gt':
+            disp_path = self.disparity_list[index]
+            edge_path = disp_path.replace('/disparity/', '/gtedge/').replace('.pfm', '.png')
+            if osp.exists(edge_path):
+                edge = cv2.imread(edge_path, cv2.IMREAD_GRAYSCALE)
+                if edge is not None:
+                    edge = edge.astype(np.float32) / 255.0  # [H, W] in [0, 1]
+                    # 确保 edge 和 img1 尺寸一致（数据增强前）
+                    h_img, w_img = img1.shape[:2]
+                    h_edge, w_edge = edge.shape[:2]
+                    if (h_edge, w_edge) != (h_img, w_img):
+                        edge = cv2.resize(edge, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
+                else:
+                    logging.warning(f"Failed to read edge map: {edge_path}, using None")
+            else:
+                logging.warning(f"Edge map not found: {edge_path}, using None")
+
         if self.augmentor is not None:
             if self.sparse:
-                img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
+                # 传递 edge 给 SparseFlowAugmentor，让它同步应用空间变换
+                if edge is not None:
+                    img1, img2, flow, valid, edge = self.augmentor(img1, img2, flow, valid, edge)
+                else:
+                    img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
             else:
-
-                img1, img2, flow = self.augmentor(img1, img2, flow)
+                # 传递 edge 给 FlowAugmentor，让它同步应用空间变换（scale/flip/crop）
+                if edge is not None:
+                    img1, img2, flow, edge = self.augmentor(img1, img2, flow, edge)
+                else:
+                    img1, img2, flow = self.augmentor(img1, img2, flow)
 
         img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
         img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
@@ -101,13 +129,19 @@ class StereoDataset(data.Dataset):
             valid = (flow[0].abs() < 512) & (flow[1].abs() < 512)
 
         if self.img_pad is not None:
-
             padH, padW = self.img_pad
             img1 = F.pad(img1, [padW]*2 + [padH]*2)
             img2 = F.pad(img2, [padW]*2 + [padH]*2)
+            if edge is not None:
+                edge = F.pad(edge, [padW]*2 + [padH]*2)
 
         flow = flow[:1]
-        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float()
+        
+        # 将 edge 转换为 tensor
+        if edge is not None:
+            edge = torch.from_numpy(edge).unsqueeze(0).float()  # [1, H, W]
+        
+        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float(), edge
 
 
     def __mul__(self, v):
@@ -123,8 +157,8 @@ class StereoDataset(data.Dataset):
 
 
 class SceneFlowDatasets(StereoDataset):
-    def __init__(self, aug_params=None, root='/home/qi.xiong/StereoMatching/IGEV-Improve/data/sceneflow/', dstype='frames_finalpass', things_test=False):
-        super(SceneFlowDatasets, self).__init__(aug_params)
+    def __init__(self, aug_params=None, root='/home/qi.xiong/StereoMatching/IGEV-Improve/data/sceneflow/', dstype='frames_finalpass', things_test=False, edge_source='rcf'):
+        super(SceneFlowDatasets, self).__init__(aug_params, edge_source=edge_source)
         self.root = root
         self.dstype = dstype
 
@@ -188,8 +222,8 @@ class SceneFlowDatasets(StereoDataset):
 
 
 class ETH3D(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/ETH3D', split='training'):
-        super(ETH3D, self).__init__(aug_params, sparse=True)
+    def __init__(self, aug_params=None, root='/data/ETH3D', split='training', edge_source='rcf'):
+        super(ETH3D, self).__init__(aug_params, sparse=True, edge_source=edge_source)
 
         image1_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im0.png')) )
         image2_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im1.png')) )
@@ -200,8 +234,8 @@ class ETH3D(StereoDataset):
             self.disparity_list += [ disp ]
 
 class SintelStereo(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/SintelStereo'):
-        super().__init__(aug_params, sparse=True, reader=frame_utils.readDispSintelStereo)
+    def __init__(self, aug_params=None, root='datasets/SintelStereo', edge_source='rcf'):
+        super().__init__(aug_params, sparse=True, reader=frame_utils.readDispSintelStereo, edge_source=edge_source)
 
         image1_list = sorted( glob(osp.join(root, 'training/*_left/*/frame_*.png')) )
         image2_list = sorted( glob(osp.join(root, 'training/*_right/*/frame_*.png')) )
@@ -213,8 +247,8 @@ class SintelStereo(StereoDataset):
             self.disparity_list += [ disp ]
 
 class FallingThings(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/FallingThings'):
-        super().__init__(aug_params, reader=frame_utils.readDispFallingThings)
+    def __init__(self, aug_params=None, root='datasets/FallingThings', edge_source='rcf'):
+        super().__init__(aug_params, reader=frame_utils.readDispFallingThings, edge_source=edge_source)
         assert os.path.exists(root)
 
         with open(os.path.join(root, 'filenames.txt'), 'r') as f:
@@ -229,8 +263,8 @@ class FallingThings(StereoDataset):
             self.disparity_list += [ disp ]
 
 class TartanAir(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets', keywords=[]):
-        super().__init__(aug_params, reader=frame_utils.readDispTartanAir)
+    def __init__(self, aug_params=None, root='datasets', keywords=[], edge_source='rcf'):
+        super().__init__(aug_params, reader=frame_utils.readDispTartanAir, edge_source=edge_source)
         assert os.path.exists(root)
 
         with open(os.path.join(root, 'tartanair_filenames.txt'), 'r') as f:
@@ -247,8 +281,8 @@ class TartanAir(StereoDataset):
             self.disparity_list += [ disp ]
 
 class KITTI(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/KITTI/KITTI_2015', image_set='training'):
-        super(KITTI, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispKITTI)
+    def __init__(self, aug_params=None, root='/data/KITTI/KITTI_2015', image_set='training', edge_source='rcf'):
+        super(KITTI, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispKITTI, edge_source=edge_source)
         assert os.path.exists(root)
 
         root_12 = '/data/KITTI/KITTI_2012'
@@ -267,8 +301,8 @@ class KITTI(StereoDataset):
 
 
 class Middlebury(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/Middlebury', split='F'):
-        super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury)
+    def __init__(self, aug_params=None, root='/data/Middlebury', split='F', edge_source='rcf'):
+        super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury, edge_source=edge_source)
         assert os.path.exists(root)
         assert split in "FHQ"
         lines = list(map(osp.basename, glob(os.path.join(root, "trainingH/*"))))
@@ -297,28 +331,30 @@ def fetch_dataloader(args):
     if hasattr(args, "do_flip") and args.do_flip is not None:
         aug_params["do_flip"] = args.do_flip
 
+    # 获取 edge_source 参数
+    edge_source = getattr(args, 'edge_source', 'rcf')
 
     train_dataset = None
     for dataset_name in args.train_datasets:
         if re.compile("middlebury_.*").fullmatch(dataset_name):
-            new_dataset = Middlebury(aug_params, split=dataset_name.replace('middlebury_',''))
+            new_dataset = Middlebury(aug_params, split=dataset_name.replace('middlebury_',''), edge_source=edge_source)
         elif dataset_name == 'sceneflow':
             #clean_dataset = SceneFlowDatasets(aug_params, dstype='frames_cleanpass')
-            final_dataset = SceneFlowDatasets(aug_params, dstype='frames_finalpass')
+            final_dataset = SceneFlowDatasets(aug_params, dstype='frames_finalpass', edge_source=edge_source)
             #new_dataset = (clean_dataset*4) + (final_dataset*4)
             new_dataset = final_dataset
             logging.info(f"Adding {len(new_dataset)} samples from SceneFlow")
         elif 'kitti' in dataset_name:
-            new_dataset = KITTI(aug_params)
+            new_dataset = KITTI(aug_params, edge_source=edge_source)
             logging.info(f"Adding {len(new_dataset)} samples from KITTI")
         elif dataset_name == 'sintel_stereo':
-            new_dataset = SintelStereo(aug_params)*140
+            new_dataset = SintelStereo(aug_params, edge_source=edge_source)*140
             logging.info(f"Adding {len(new_dataset)} samples from Sintel Stereo")
         elif dataset_name == 'falling_things':
-            new_dataset = FallingThings(aug_params)*5
+            new_dataset = FallingThings(aug_params, edge_source=edge_source)*5
             logging.info(f"Adding {len(new_dataset)} samples from FallingThings")
         elif dataset_name.startswith('tartan_air'):
-            new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
+            new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:], edge_source=edge_source)
             logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 

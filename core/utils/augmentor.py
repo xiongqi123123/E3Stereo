@@ -110,7 +110,7 @@ class FlowAugmentor:
 
         return img1, img2
 
-    def spatial_transform(self, img1, img2, flow):
+    def spatial_transform(self, img1, img2, flow, edge=None):
         # randomly sample scale
         ht, wd = img1.shape[:2]
         min_scale = np.maximum(
@@ -132,6 +132,8 @@ class FlowAugmentor:
             img1 = cv2.resize(img1, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
             img2 = cv2.resize(img2, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
             flow = cv2.resize(flow, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
+            if edge is not None:
+                edge = cv2.resize(edge, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
 
             flow = flow * [scale_x, scale_y]
 
@@ -140,16 +142,22 @@ class FlowAugmentor:
                 img1 = img1[:, ::-1]
                 img2 = img2[:, ::-1]
                 flow = flow[:, ::-1] * [-1.0, 1.0]
+                if edge is not None:
+                    edge = edge[:, ::-1]
 
             if np.random.rand() < self.h_flip_prob and self.do_flip == 'h': # h-flip for stereo
                 tmp = img1[:, ::-1]
                 img1 = img2[:, ::-1]
                 img2 = tmp
+                if edge is not None:
+                    edge = edge[:, ::-1]
 
             if np.random.rand() < self.v_flip_prob and self.do_flip == 'v': # v-flip
                 img1 = img1[::-1, :]
                 img2 = img2[::-1, :]
                 flow = flow[::-1, :] * [1.0, -1.0]
+                if edge is not None:
+                    edge = edge[::-1, :]
 
         if self.yjitter:
             y0 = np.random.randint(2, img1.shape[0] - self.crop_size[0] - 2)
@@ -159,6 +167,8 @@ class FlowAugmentor:
             img1 = img1[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
             img2 = img2[y1:y1+self.crop_size[0], x0:x0+self.crop_size[1]]
             flow = flow[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
+            if edge is not None:
+                edge = edge[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
 
         else:
             y0 = np.random.randint(0, img1.shape[0] - self.crop_size[0])
@@ -167,20 +177,34 @@ class FlowAugmentor:
             img1 = img1[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
             img2 = img2[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
             flow = flow[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
+            if edge is not None:
+                edge = edge[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
 
-        return img1, img2, flow
+        if edge is not None:
+            return img1, img2, flow, edge
+        else:
+            return img1, img2, flow
 
 
-    def __call__(self, img1, img2, flow):
+    def __call__(self, img1, img2, flow, edge=None):
         img1, img2 = self.color_transform(img1, img2)
         img1, img2 = self.eraser_transform(img1, img2)
-        img1, img2, flow = self.spatial_transform(img1, img2, flow)
+        result = self.spatial_transform(img1, img2, flow, edge)
+        
+        if edge is not None:
+            img1, img2, flow, edge = result
+            edge = np.ascontiguousarray(edge)
+        else:
+            img1, img2, flow = result
 
         img1 = np.ascontiguousarray(img1)
         img2 = np.ascontiguousarray(img2)
         flow = np.ascontiguousarray(flow)
 
-        return img1, img2, flow
+        if edge is not None:
+            return img1, img2, flow, edge
+        else:
+            return img1, img2, flow
 
 class SparseFlowAugmentor:
     def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=False, yjitter=False, saturation_range=[0.7,1.3], gamma=[1,1,1,1]):
@@ -255,7 +279,7 @@ class SparseFlowAugmentor:
 
         return flow_img, valid_img
 
-    def spatial_transform(self, img1, img2, flow, valid):
+    def spatial_transform(self, img1, img2, flow, valid, edge=None):
         # randomly sample scale
 
         ht, wd = img1.shape[:2]
@@ -272,22 +296,30 @@ class SparseFlowAugmentor:
             img1 = cv2.resize(img1, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
             img2 = cv2.resize(img2, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
             flow, valid = self.resize_sparse_flow_map(flow, valid, fx=scale_x, fy=scale_y)
+            if edge is not None:
+                edge = cv2.resize(edge, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_LINEAR)
 
         if self.do_flip:
             if np.random.rand() < self.h_flip_prob and self.do_flip == 'hf': # h-flip
                 img1 = img1[:, ::-1]
                 img2 = img2[:, ::-1]
                 flow = flow[:, ::-1] * [-1.0, 1.0]
+                if edge is not None:
+                    edge = edge[:, ::-1]
 
             if np.random.rand() < self.h_flip_prob and self.do_flip == 'h': # h-flip for stereo
                 tmp = img1[:, ::-1]
                 img1 = img2[:, ::-1]
                 img2 = tmp
+                if edge is not None:
+                    edge = edge[:, ::-1]
 
             if np.random.rand() < self.v_flip_prob and self.do_flip == 'v': # v-flip
                 img1 = img1[::-1, :]
                 img2 = img2[::-1, :]
                 flow = flow[::-1, :] * [1.0, -1.0]
+                if edge is not None:
+                    edge = edge[::-1, :]
 
         margin_y = 20
         margin_x = 50
@@ -302,18 +334,32 @@ class SparseFlowAugmentor:
         img2 = img2[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         flow = flow[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         valid = valid[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
+        if edge is not None:
+            edge = edge[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         
-        return img1, img2, flow, valid
+        if edge is not None:
+            return img1, img2, flow, valid, edge
+        else:
+            return img1, img2, flow, valid
 
 
-    def __call__(self, img1, img2, flow, valid):
+    def __call__(self, img1, img2, flow, valid, edge=None):
         img1, img2 = self.color_transform(img1, img2)
         img1, img2 = self.eraser_transform(img1, img2)
-        img1, img2, flow, valid = self.spatial_transform(img1, img2, flow, valid)
+        result = self.spatial_transform(img1, img2, flow, valid, edge)
+        
+        if edge is not None:
+            img1, img2, flow, valid, edge = result
+            edge = np.ascontiguousarray(edge)
+        else:
+            img1, img2, flow, valid = result
 
         img1 = np.ascontiguousarray(img1)
         img2 = np.ascontiguousarray(img2)
         flow = np.ascontiguousarray(flow)
         valid = np.ascontiguousarray(valid)
 
-        return img1, img2, flow, valid
+        if edge is not None:
+            return img1, img2, flow, valid, edge
+        else:
+            return img1, img2, flow, valid

@@ -70,6 +70,10 @@ class SepConvGRU(nn.Module):
         return h
 
 class BasicMotionEncoder(nn.Module):
+    """
+    Motion Encoder: 将 disp 与 corr 编码为 motion_features，供 GRU 迭代更新使用。
+    可选：将 Edge 注入编码过程，使 motion 特征在边界处更具判别力。
+    """
     def __init__(self, args):
         super(BasicMotionEncoder, self).__init__()
         self.args = args
@@ -80,7 +84,34 @@ class BasicMotionEncoder(nn.Module):
         self.convd2 = nn.Conv2d(64, 64, 3, padding=1)
         self.conv = nn.Conv2d(64+64, 128-1, 3, padding=1)
 
-    def forward(self, disp, corr):
+        # ================== Edge-Guided Motion Encoder ====================##
+        # 将 Edge 注入 motion_features，支持 concat / film / gated 三种融合
+        self.edge_motion_encoder = getattr(args, 'edge_motion_encoder', False)
+        self.edge_motion_fusion_mode = getattr(args, 'edge_motion_fusion_mode', 'film')
+        motion_dim = 128
+        if self.edge_motion_encoder:
+            if self.edge_motion_fusion_mode == 'concat':
+                self.edge_motion_fusion = nn.Sequential(
+                    nn.Conv2d(motion_dim + 1, motion_dim, 1),
+                    nn.ReLU(inplace=True),
+                )
+            elif self.edge_motion_fusion_mode == 'film':
+                self.edge_motion_film = nn.Sequential(
+                    nn.Conv2d(1, 32, 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(32, motion_dim * 2, 1),
+                )
+            elif self.edge_motion_fusion_mode == 'gated':
+                self.edge_motion_gate = nn.Sequential(
+                    nn.Conv2d(motion_dim + 1, motion_dim, 1),
+                    nn.Sigmoid(),
+                )
+                self.edge_motion_proj = nn.Conv2d(1, motion_dim, 3, padding=1)
+            else:
+                raise ValueError(f"edge_motion_fusion_mode must be concat/film/gated, got {self.edge_motion_fusion_mode}")
+        # ================== End Edge-Guided Motion Encoder ====================##
+
+    def forward(self, disp, corr, edge=None):
         cor = F.relu(self.convc1(corr))
         cor = F.relu(self.convc2(cor))
         disp_ = F.relu(self.convd1(disp))
@@ -88,7 +119,24 @@ class BasicMotionEncoder(nn.Module):
 
         cor_disp = torch.cat([cor, disp_], dim=1)
         out = F.relu(self.conv(cor_disp))
-        return torch.cat([out, disp], dim=1)
+        motion_features = torch.cat([out, disp], dim=1)  # 128 ch
+
+        # ================== Edge-Guided Motion Encoder ====================##
+        if self.edge_motion_encoder and edge is not None:
+            edge_resized = F.interpolate(edge, size=motion_features.shape[2:], mode='bilinear', align_corners=False)
+            if self.edge_motion_fusion_mode == 'concat':
+                feat_with_edge = torch.cat([motion_features, edge_resized], dim=1)
+                motion_features = motion_features + self.edge_motion_fusion(feat_with_edge)
+            elif self.edge_motion_fusion_mode == 'film':
+                gamma, beta = self.edge_motion_film(edge_resized).chunk(2, dim=1)
+                motion_features = (1 + gamma) * motion_features + beta
+            elif self.edge_motion_fusion_mode == 'gated':
+                gate = self.edge_motion_gate(torch.cat([motion_features, edge_resized], dim=1))
+                edge_proj = self.edge_motion_proj(edge_resized)
+                motion_features = gate * motion_features + (1 - gate) * edge_proj
+        # ================== End Edge-Guided Motion Encoder ====================##
+
+        return motion_features
 
 def pool2x(x):
     return F.avg_pool2d(x, 3, stride=2, padding=1)
@@ -175,7 +223,7 @@ class BasicMultiUpdateBlock(nn.Module):
             else:
                 net[1] = self.gru08(net[1], *(inp[1]), pool2x(net[0]))
         if iter04:
-            motion_features = self.encoder(disp, corr)
+            motion_features = self.encoder(disp, corr, edge=edge)
             if self.args.n_gru_layers > 1:
                 net[0] = self.gru04(net[0], *(inp[0]), motion_features, interp(net[1], net[0]))
             else:

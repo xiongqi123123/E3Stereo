@@ -10,9 +10,11 @@ import time
 import logging
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from igev_stereo import IGEVStereo, autocast
 import stereo_datasets as datasets
+import cv2
 from utils.utils import InputPadder
 from PIL import Image
 
@@ -123,20 +125,32 @@ def validate_kitti(model, iters=32, mixed_prec=False):
 def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
     """ Peform validation using the Scene Flow (TEST) split """
     model.eval()
-    val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True)
+    # 从 args 获取 edge_source，确保验证数据集与训练时一致
+    edge_source = getattr(args, 'edge_source', 'rcf') if args is not None else 'rcf'
+    val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True, edge_source=edge_source)
 
     out_list, epe_list = [], []
     for val_id in tqdm(range(len(val_dataset))):
-        _, image1, image2, flow_gt, valid_gt = val_dataset[val_id]
+        data_item = val_dataset[val_id]
+        # 数据可能包含 edge（如果 edge_source='gt'）
+        if len(data_item) == 6:
+            meta, image1, image2, flow_gt, valid_gt, left_edge = data_item
+        else:
+            meta, image1, image2, flow_gt, valid_gt = data_item
+            left_edge = None
 
         image1 = image1[None].cuda()
         image2 = image2[None].cuda()
+        
+        # 如果从数据集获取了 edge，需要添加 batch 维度并移到 GPU
+        if left_edge is not None:
+            left_edge = left_edge[None].cuda()
 
         padder = InputPadder(image1.shape, divis_by=32)
         image1, image2 = padder.pad(image1, image2)
 
         with autocast(enabled=mixed_prec):
-            flow_pr = model(image1, image2, iters=iters, test_mode=True)
+            flow_pr = model(image1, image2, iters=iters, test_mode=True, left_edge=left_edge)
         flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
         assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
 
@@ -161,15 +175,23 @@ def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
     epe = np.mean(epe_list)
     d1 = 100 * np.mean(out_list)
     if args is not None and getattr(args, 'edge_context_fusion', False):
-        f = open(f'{getattr(args, "edge_fusion_mode", "film")}-context-test.txt', 'a')
+        f = open(f'test/{getattr(args, "edge_fusion_mode", "film")}-context-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
     elif args is not None and getattr(args, 'edge_guided_upsample', False):
-        f = open(f'{getattr(args, "edge_upsample_fusion_mode", "film")}-upsample-test.txt', 'a')
+        f = open(f'test/{getattr(args, "edge_upsample_fusion_mode", "film")}-upsample-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
     elif args is not None and getattr(args, 'edge_guided_disp_head', False):
-        f = open(f'{getattr(args, "edge_disp_fusion_mode", "film")}-disp-head-test.txt', 'a')
+        f = open(f'test/{getattr(args, "edge_disp_fusion_mode", "film")}-disp-head-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
     elif args is not None and getattr(args, 'edge_guided_cost_agg', False):
-        f = open(f'{getattr(args, "edge_cost_agg_fusion_mode", "film")}-cost-agg-test.txt', 'a')
+        f = open(f'test/{getattr(args, "edge_cost_agg_fusion_mode", "film")}-cost-agg-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
+    elif args is not None and getattr(args, 'edge_guided_gwc', False):
+        f = open(f'test/{getattr(args, "edge_gwc_fusion_mode", "film")}-gwc-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
+    elif args is not None and getattr(args, 'edge_motion_encoder', False):
+        f = open(f'test/{getattr(args, "edge_motion_fusion_mode", "film")}-motion-encoder-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
+    elif args is not None and getattr(args, 'boundary_only_refinement', False):
+        f = open(f'test/{getattr(args, "edge_refinement_fusion_mode", "film")}-boundary-only-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
+    elif args is not None and getattr(args, 'edge_guided_refinement', False):
+        f = open(f'test/{getattr(args, "edge_refinement_fusion_mode", "film")}-refinement-{getattr(args, "edge_source", "rcf")}-test.txt', 'a')
     else:
-        f = open('test.txt', 'a')
+        f = open('test/test.txt', 'a')
     f.write("Validation Scene Flow: %f, %f\n" % (epe, d1))
 
     print("Validation Scene Flow: %f, %f" % (epe, d1))
@@ -237,6 +259,8 @@ if __name__ == '__main__':
     parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
+    parser.add_argument('--edge_source', type=str, default='rcf', choices=['rcf', 'gt'],
+                        help="edge source: 'rcf' use RCF online prediction, 'gt' use gtedge pre-generated edge.")
     parser.add_argument('--edge_model', type=str, default='../RCF-PyTorch/rcf.pth', help='path to the edge model')
     parser.add_argument('--edge_context_fusion', action='store_true',
                         help='fuse edge into context features for GRU input')
@@ -253,6 +277,20 @@ if __name__ == '__main__':
     parser.add_argument('--edge_guided_cost_agg', action='store_true',
                         help='inject edge into cost_agg (Hourglass) for better init_disp')
     parser.add_argument('--edge_cost_agg_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_guided_gwc', action='store_true',
+                        help='inject edge into GWC corr_feature_att for boundary-aware initial cost')
+    parser.add_argument('--edge_gwc_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_motion_encoder', action='store_true',
+                        help='inject edge into Motion Encoder for boundary-aware motion features')
+    parser.add_argument('--edge_motion_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
+    parser.add_argument('--edge_guided_refinement', action='store_true',
+                        help='edge-guided disparity refinement for sharper boundaries')
+    parser.add_argument('--boundary_only_refinement', action='store_true',
+                        help='refinement only at boundary regions (mask by edge)')
+    parser.add_argument('--edge_refinement_fusion_mode', type=str, default='film',
                         choices=['concat', 'film', 'gated'])
     args = parser.parse_args()
 
