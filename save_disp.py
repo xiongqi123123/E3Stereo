@@ -92,6 +92,9 @@ if __name__ == '__main__':
     parser.add_argument('--edge_guided_disp_head', action='store_true')
     parser.add_argument('--edge_disp_fusion_mode', type=str, default='film',
                         choices=['concat', 'film', 'gated', 'mlp'])
+    parser.add_argument('--edge_guided_cost_agg', action='store_true')
+    parser.add_argument('--edge_cost_agg_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
     args = parser.parse_args()
 
     demo(args)

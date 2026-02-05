@@ -166,6 +166,8 @@ def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
         f = open(f'{getattr(args, "edge_upsample_fusion_mode", "film")}-upsample-test.txt', 'a')
     elif args is not None and getattr(args, 'edge_guided_disp_head', False):
         f = open(f'{getattr(args, "edge_disp_fusion_mode", "film")}-disp-head-test.txt', 'a')
+    elif args is not None and getattr(args, 'edge_guided_cost_agg', False):
+        f = open(f'{getattr(args, "edge_cost_agg_fusion_mode", "film")}-cost-agg-test.txt', 'a')
     else:
         f = open('test.txt', 'a')
     f.write("Validation Scene Flow: %f, %f\n" % (epe, d1))
@@ -248,6 +250,10 @@ if __name__ == '__main__':
     parser.add_argument('--edge_guided_disp_head', action='store_true')
     parser.add_argument('--edge_disp_fusion_mode', type=str, default='film',
                         choices=['concat', 'film', 'gated', 'mlp'])
+    parser.add_argument('--edge_guided_cost_agg', action='store_true',
+                        help='inject edge into cost_agg (Hourglass) for better init_disp')
+    parser.add_argument('--edge_cost_agg_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'])
     args = parser.parse_args()
 
     model = torch.nn.DataParallel(IGEVStereo(args), device_ids=[0])

@@ -522,7 +522,7 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
     
     # Edge augmentation (需配合 edge_model 使用)
-    parser.add_argument('--edge_model', type=str, default='../RCF-PyTorch/rcf.pth', help='path to the edge model (required when edge_context_fusion or edge_guided_upsample)')
+    parser.add_argument('--edge_model', type=str, default='../RCF-PyTorch/rcf.pth', help='path to the edge model (required when any edge_* is enabled)')
     parser.add_argument('--edge_context_fusion', action='store_true',
                         help='fuse edge into context features for GRU input')
     parser.add_argument('--edge_fusion_mode', type=str, default='film',
@@ -538,6 +538,11 @@ if __name__ == '__main__':
     parser.add_argument('--edge_disp_fusion_mode', type=str, default='film',
                         choices=['concat', 'film', 'gated', 'mlp'],
                         help='edge-disp fusion: concat/film/gated/mlp')
+    parser.add_argument('--edge_guided_cost_agg', action='store_true',
+                        help='inject edge into cost_agg (Hourglass) for better init_disp at boundaries')
+    parser.add_argument('--edge_cost_agg_fusion_mode', type=str, default='film',
+                        choices=['concat', 'film', 'gated'],
+                        help='edge-cost_agg fusion: concat/film/gated')
     args = parser.parse_args()
 
     torch.manual_seed(666)

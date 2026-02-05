@@ -210,14 +210,55 @@ class IGEVStereo(nn.Module):
         self.cost_agg = hourglass(8)
         self.classifier = nn.Conv3d(8, 1, 3, 1, 1, bias=False)
 
+        # ================== Edge-Guided Cost Aggregation (Hourglass) ====================##
+        # 将 Edge 注入 cost_agg 的 FeatureAtt，使 Hourglass 在物体边界处产生更优的 init_disp
+        # 融合方式：concat / film / gated，与 features[1/2/3] 的通道 (64,192,160) 对应
+        self.edge_guided_cost_agg = getattr(args, 'edge_guided_cost_agg', False)
+        self.edge_cost_agg_fusion_mode = getattr(args, 'edge_cost_agg_fusion_mode', 'film')
+        if self.edge_guided_cost_agg:
+            feat_chans = [64, 192, 160]  # features[1], [2], [3] 通道数
+            if self.edge_cost_agg_fusion_mode == 'concat':
+                self.edge_cost_agg_fusion = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(feat_chans[i] + 1, feat_chans[i], 1),
+                        nn.ReLU(inplace=True),
+                    )
+                    for i in range(3)
+                ])
+            elif self.edge_cost_agg_fusion_mode == 'film':
+                self.edge_cost_agg_film = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(1, feat_chans[i] // 4, 3, padding=1),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(feat_chans[i] // 4, feat_chans[i] * 2, 1),
+                    )
+                    for i in range(3)
+                ])
+            elif self.edge_cost_agg_fusion_mode == 'gated':
+                self.edge_cost_agg_gate = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(feat_chans[i] + 1, feat_chans[i], 1),
+                        nn.Sigmoid(),
+                    )
+                    for i in range(3)
+                ])
+                self.edge_cost_agg_proj = nn.ModuleList([
+                    nn.Conv2d(1, feat_chans[i], 3, padding=1)
+                    for i in range(3)
+                ])
+            else:
+                raise ValueError(f"edge_cost_agg_fusion_mode must be concat/film/gated, got {self.edge_cost_agg_fusion_mode}")
+        # ================== End Edge-Guided Cost Aggregation ====================##
+
         # ================== Edge Branch ====================##
         # 仅当任一 Edge 相关功能启用时加载 Edge 分支，否则与原始 IGEV 完全一致
         self.edge_guided_disp_head = getattr(args, 'edge_guided_disp_head', False)
-        self._use_edge = self.edge_context_fusion or self.edge_guided_upsample or self.edge_guided_disp_head
+        self._use_edge = (self.edge_context_fusion or self.edge_guided_upsample or
+                         self.edge_guided_disp_head or self.edge_guided_cost_agg)
         if self._use_edge:
             edge_model_path = getattr(args, 'edge_model', None)
             if edge_model_path is None:
-                raise ValueError("edge_model is required when edge_context_fusion or edge_guided_upsample is enabled")
+                raise ValueError("edge_model is required when any edge_* feature is enabled")
             self.edge = RCF()
             self.edge.load_state_dict(torch.load(edge_model_path, map_location='cpu'), strict=False)
             for param in self.edge.parameters():
@@ -298,7 +339,29 @@ class IGEVStereo(nn.Module):
             gwc_volume = build_gwc_volume(match_left, match_right, self.args.max_disp//4, 8)
             gwc_volume = self.corr_stem(gwc_volume)
             gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
-            geo_encoding_volume = self.cost_agg(gwc_volume, features_left)
+            # ================== Edge-Guided Cost Aggregation ====================##
+            # 将 left_edge 注入 features[1/2/3]，使 Hourglass 的 FeatureAtt 在边界处产生更优的 init_disp
+            cost_agg_features = list(features_left)
+            if self.edge_guided_cost_agg and left_edge is not None:
+                for i in range(1, 4):  # features[1], [2], [3] -> fusion modules [0], [1], [2]
+                    idx = i - 1
+                    edge_resized = F.interpolate(
+                        left_edge, size=features_left[i].shape[2:],
+                        mode='bilinear', align_corners=False
+                    )
+                    feat = features_left[i]
+                    if self.edge_cost_agg_fusion_mode == 'concat':
+                        feat_with_edge = torch.cat([feat, edge_resized], dim=1)
+                        cost_agg_features[i] = self.edge_cost_agg_fusion[idx](feat_with_edge)
+                    elif self.edge_cost_agg_fusion_mode == 'film':
+                        gamma, beta = self.edge_cost_agg_film[idx](edge_resized).chunk(2, dim=1)
+                        cost_agg_features[i] = (1 + gamma) * feat + beta
+                    elif self.edge_cost_agg_fusion_mode == 'gated':
+                        gate = self.edge_cost_agg_gate[idx](torch.cat([feat, edge_resized], dim=1))
+                        edge_proj = self.edge_cost_agg_proj[idx](edge_resized)
+                        cost_agg_features[i] = gate * feat + (1 - gate) * edge_proj
+            geo_encoding_volume = self.cost_agg(gwc_volume, cost_agg_features)
+            # ================== End Edge-Guided Cost Aggregation ====================##
 
             # Init disp from geometry encoding volume
             prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
