@@ -235,8 +235,11 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
         if gt.dim() == 4:
             gt = gt.squeeze(1)
         loss = F.smooth_l1_loss(pred, gt, reduction='none')
-        # 只取 mask 区域，并乘以对应的像素权重
-        return (loss * weights)[mask].mean()
+        # 正确的加权平均：sum(loss * weights) / sum(weights)
+        # 这样不会改变loss的scale，只是重新分配权重
+        weighted_loss = (loss * weights)[mask]
+        weight_sum = weights[mask].sum()
+        return weighted_loss.sum() / (weight_sum + 1e-8)
 
     disp_loss = 0.0
 
@@ -253,9 +256,11 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
             pred_i = pred_i.squeeze(1)
         gt = disp_gt.squeeze(1) if disp_gt.dim() == 4 else disp_gt
 
-        # 计算每一次迭代的加权 Loss
+        # 计算每一次迭代的加权 Loss（正确的加权平均）
         i_loss_val = (pred_i - gt).abs()
-        weighted_loss_val = (i_loss_val * pixel_weights)[valid_mask].mean()
+        weighted_loss = (i_loss_val * pixel_weights)[valid_mask]
+        weight_sum = pixel_weights[valid_mask].sum()
+        weighted_loss_val = weighted_loss.sum() / (weight_sum + 1e-8)
 
         disp_loss += i_weight * weighted_loss_val
 
@@ -297,8 +302,15 @@ def fetch_optimizer(args, model):
     """ Create the optimizer and learning rate scheduler """
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
 
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
-            pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
+    # 快速验证模式：使用常数LR（适合从预训练权重finetune）
+    if hasattr(args, 'use_constant_lr') and args.use_constant_lr:
+        scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=args.num_steps)
+        logging.info("Using ConstantLR for quick verification from pretrained weights")
+    else:
+        # 标准训练模式：使用OneCycleLR
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
+                pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
+        logging.info("Using OneCycleLR for full training")
     return optimizer, scheduler
 
 
@@ -504,7 +516,7 @@ def train(args):
 
             if total_steps > 0 and total_steps % args.valid_freq == 0:
                 # 定期保存checkpoint
-                save_path = Path(args.logdir + '/%d_%s.pth' % (total_steps + 1, args.name))
+                save_path = Path(args.logdir + '/%d_%s.pth' % (total_steps, args.name))
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
@@ -546,8 +558,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='igev-stereo', help="name your experiment")
     parser.add_argument('--restore_ckpt',
-                        default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
-                        # default=None,
+                        # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
+                        default=None,
                         help="load the weights from a specific checkpoint")
     parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
     parser.add_argument('--precision_dtype', default='float16', choices=['float16', 'bfloat16', 'float32'], help='Choose precision type: float16 or bfloat16 or float32')
@@ -557,19 +569,21 @@ if __name__ == '__main__':
     # (注：根据你实际显存情况调整，能开到 8 最好，开不到就 4 + Gradient Accumulation)
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=25000, help="length of training schedule.")
+    parser.add_argument('--use_constant_lr', action='store_true',
+                        help='Use constant LR instead of OneCycleLR (recommended for quick verification from pretrained weights)')
     # 如果你是单卡 32G V100，配合上述改回的 size 和 iters，可能只能跑 2 或 4。
     # 建议：如果改回 320x736 和 22 iters 后 OOM，优先降低 Batch Size 到 4，而不是降低 iters 或 size。
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
     # 标准 SceneFlow 训练尺寸是 [320, 736]。
     # 如果显存吃紧，可以折中改为 [320, 640] 或 [288, 576]，但 256x448 确实太小了。
-    parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736],
+    parser.add_argument('--image_size', type=int, nargs='+', default=[256, 512],
                         help="size of the random image crops used during training.")
-    parser.add_argument('--train_iters', type=int, default=22, help="number of updates to the disparity field in each forward pass.")
+    parser.add_argument('--train_iters', type=int, default=12, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
     # Validation parameters
-    parser.add_argument('--valid_freq', type=int, default=100, help='validation frequency (steps)')
+    parser.add_argument('--valid_freq', type=int, default=500, help='validation frequency (steps)')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of disp-field updates during validation forward pass')
     parser.add_argument('--val_samples', type=int, default=100, help='number of samples to validate (0 for all)')
 
@@ -595,9 +609,9 @@ if __name__ == '__main__':
     parser.add_argument('--edge_scale_mode', type=str, default='schedule',
                         choices=['fixed', 'schedule', 'adaptive'],
                         help='Edge scale mode: fixed (constant), schedule (warmup), adaptive (EPE-driven)')
-    parser.add_argument('--edge_scale_min', type=float, default=0.5,
+    parser.add_argument('--edge_scale_min', type=float, default=0.05,
                         help='Minimum edge scale (for schedule/adaptive modes)')
-    parser.add_argument('--edge_scale_max', type=float, default=5.0,
+    parser.add_argument('--edge_scale_max', type=float, default=0.5,
                         help='Maximum edge scale (for schedule/adaptive modes)')
     parser.add_argument('--edge_warmup_steps', type=int, default=5000,
                         help='Warmup steps for schedule mode')

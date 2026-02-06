@@ -8,8 +8,6 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.optim as optim
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 from igev_stereo import IGEVStereo
 from evaluate_stereo import *
 import stereo_datasets as datasets
@@ -339,8 +337,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='igev-stereo', help="name your experiment")
     parser.add_argument('--restore_ckpt',
-                        default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
-                        # default=None,
+                        # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
+                        default=None,
                         help="load the weights from a specific checkpoint")
     parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
     parser.add_argument('--precision_dtype', default='float16', choices=['float16', 'bfloat16', 'float32'],
@@ -348,19 +346,19 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/baseline_igev', help='the directory to save logs and checkpoints')
 
     # Training parameters - 默认快速测试配置
-    parser.add_argument('--batch_size', type=int, default=8, help="batch size used during training.")
+    parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=25000, help="length of training schedule.")
     # 标准 SceneFlow 训练尺寸是 [320, 736]。
     # 如果显存吃紧，可以折中改为 [320, 640] 或 [288, 576]，但 256x448 确实太小了。
-    parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736],
+    parser.add_argument('--image_size', type=int, nargs='+', default=[256, 512],
                         help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=22, help="不要低于 16 ield in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
     # Validation parameters
-    parser.add_argument('--valid_freq', type=int, default=100, help='validation frequency (steps)')
+    parser.add_argument('--valid_freq', type=int, default=500, help='validation frequency (steps)')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of disp-field updates during validation forward pass')
     parser.add_argument('--val_samples', type=int, default=100, help='number of samples to validate (0 for all)')
 
@@ -370,7 +368,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
-    parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
+    parser.add_argument('--max_disp', type=int, default=128, help="max disp of geometry encoding volume")
 
     # Data augmentation
     parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")

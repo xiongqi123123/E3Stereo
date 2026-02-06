@@ -12,8 +12,8 @@ from pathlib import Path
 from glob import glob
 import os.path as osp
 
-import frame_utils
-from augmentor import FlowAugmentor, SparseFlowAugmentor
+from IGEV import frame_utils
+from IGEV.augmentor import FlowAugmentor, SparseFlowAugmentor
 
 
 class StereoDataset(data.Dataset):
@@ -324,7 +324,7 @@ def fetch_dataloader(args):
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 12))-2, drop_last=True)
+        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, drop_last=True)
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
