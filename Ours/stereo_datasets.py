@@ -323,8 +323,8 @@ def fetch_dataloader(args):
             logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, drop_last=True)
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size,
+        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 8)), drop_last=True, persistent_workers=True, prefetch_factor=2)
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader

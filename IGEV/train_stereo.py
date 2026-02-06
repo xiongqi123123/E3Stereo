@@ -8,6 +8,8 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.optim as optim
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from igev_stereo import IGEVStereo
 from evaluate_stereo import *
 import stereo_datasets as datasets
@@ -100,6 +102,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map=None,
             if is_flat.sum() > 0:
                 epe_flat_val = epe[is_flat].mean().item()
 
+        d1 = (epe_flat > 3).float().mean().item()  # D1: >3px error rate
         metrics = {
             'epe': epe_flat.mean().item(),
             'epe_edge': epe_edge_val,
@@ -107,6 +110,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map=None,
             '1px': (epe_flat < 1).float().mean().item(),
             '3px': (epe_flat < 3).float().mean().item(),
             '5px': (epe_flat < 5).float().mean().item(),
+            'd1': d1,
         }
         return disp_loss, metrics
     else:
@@ -131,6 +135,7 @@ class Logger:
         self.total_steps = 0
         self.running_loss = {}
         self.writer = SummaryWriter(log_dir=logdir)
+        self.last_train_metrics = {}  # 保存最近的train metrics用于validation时打印
 
     def _print_training_status(self):
         avg_metrics = {k: self.running_loss[k]/Logger.SUM_FREQ for k in self.running_loss}
@@ -167,6 +172,9 @@ class Logger:
 
             self.running_loss[key] += metrics[key]
 
+        # 保存最近的train metrics用于validation时打印
+        self.last_train_metrics = metrics.copy()
+
         if self.total_steps % Logger.SUM_FREQ == Logger.SUM_FREQ-1:
             self._print_training_status()
             self.running_loss = {}
@@ -178,6 +186,38 @@ class Logger:
         # 为validation结果添加 "val/" 前缀，便于TensorBoard区分
         for key in results:
             self.writer.add_scalar(f"val/{key}", results[key], self.total_steps)
+
+    def print_train_val_comparison(self, val_results):
+        """打印Train和Val的对比结果"""
+        print("\n" + "="*80)
+        print(f"[IGEV Baseline] Step: {self.total_steps:>6d} - Train vs Val Comparison")
+        print("="*80)
+
+        # 获取train metrics
+        train_loss = self.last_train_metrics.get('loss', 0)
+        train_epe = self.last_train_metrics.get('epe', 0)
+        train_d1 = self.last_train_metrics.get('d1', 0) * 100  # 转为百分比
+
+        # 获取val metrics (根据dataset不同key不同)
+        val_epe = val_results.get('scene-disp-epe', val_results.get('kitti-epe', 0))
+        val_d1 = val_results.get('scene-disp-d1', val_results.get('kitti-d1', 0))
+
+        print(f"{'Metric':<15} {'Train':>12} {'Val':>12}")
+        print("-"*40)
+        print(f"{'Loss':<15} {train_loss:>12.4f} {'N/A':>12}")
+        print(f"{'EPE':<15} {train_epe:>12.4f} {val_epe:>12.4f}")
+        print(f"{'D1 (>3px)':<15} {train_d1:>11.2f}% {val_d1:>11.2f}%")
+
+        # 如果有edge/flat EPE也打印出来
+        if 'epe_edge' in self.last_train_metrics:
+            train_epe_edge = self.last_train_metrics.get('epe_edge', 0)
+            train_epe_flat = self.last_train_metrics.get('epe_flat', 0)
+            val_epe_edge = val_results.get('scene-disp-epe-edge', 0)
+            val_epe_flat = val_results.get('scene-disp-epe-flat', 0)
+            print(f"{'EPE_edge':<15} {train_epe_edge:>12.4f} {val_epe_edge:>12.4f}")
+            print(f"{'EPE_flat':<15} {train_epe_flat:>12.4f} {val_epe_flat:>12.4f}")
+
+        print("="*80 + "\n")
 
     def close(self):
         self.writer.close()
@@ -270,6 +310,9 @@ def train(args):
                     raise Exception('Unknown validation dataset.')
                 logger.write_dict(results)
 
+                # 打印Train vs Val对比
+                logger.print_train_val_comparison(results)
+
                 # 根据EPE保存最优checkpoint
                 current_epe = results.get('scene-disp-epe', results.get('kitti-epe', float('inf')))
                 if current_epe < best_epe:
@@ -305,17 +348,20 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/baseline_igev', help='the directory to save logs and checkpoints')
 
     # Training parameters - 默认快速测试配置
-    parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
+    parser.add_argument('--batch_size', type=int, default=8, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
-    parser.add_argument('--image_size', type=int, nargs='+', default=[256, 448], help="size of the random image crops used during training.")
-    parser.add_argument('--train_iters', type=int, default=8, help="number of updates to the disparity field in each forward pass.")
+    # 标准 SceneFlow 训练尺寸是 [320, 736]。
+    # 如果显存吃紧，可以折中改为 [320, 640] 或 [288, 576]，但 256x448 确实太小了。
+    parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736],
+                        help="size of the random image crops used during training.")
+    parser.add_argument('--train_iters', type=int, default=22, help="不要低于 16 ield in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
     # Validation parameters
-    parser.add_argument('--valid_freq', type=int, default=200, help='validation frequency (steps)')
-    parser.add_argument('--valid_iters', type=int, default=16, help='number of disp-field updates during validation forward pass')
+    parser.add_argument('--valid_freq', type=int, default=100, help='validation frequency (steps)')
+    parser.add_argument('--valid_iters', type=int, default=32, help='number of disp-field updates during validation forward pass')
     parser.add_argument('--val_samples', type=int, default=100, help='number of samples to validate (0 for all)')
 
     # Architecure choices
@@ -324,7 +370,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
-    parser.add_argument('--max_disp', type=int, default=128, help="max disp of geometry encoding volume")
+    parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
 
     # Data augmentation
     parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")

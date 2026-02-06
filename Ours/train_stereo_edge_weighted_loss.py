@@ -58,16 +58,22 @@ def extract_edge_from_image(image, method='sobel'):
     # 梯度幅值
     edge_strength = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
 
-    # 归一化到 [0, 1]，使用 percentile 截断极端值
+    # 归一化到 [0, 1]，使用快速的batch-wise归一化
+    # 避免使用torch.quantile（O(n log n)）和for循环
+    # 方法：对每个样本，除以该样本的最大值的98%（近似percentile但更快）
     B = edge_strength.shape[0]
-    edge_normalized = torch.zeros_like(edge_strength)
-    for b in range(B):
-        e = edge_strength[b]
-        # 使用 98 percentile 作为上界，避免极端值影响
-        upper = torch.quantile(e.flatten(), 0.98)
-        e_clipped = torch.clamp(e, 0, upper)
-        e_norm = e_clipped / (upper + 1e-8)
-        edge_normalized[b] = e_norm
+
+    # 快速向量化归一化：对每个样本，使用 max * 0.98 作为上界
+    # reshape到 [B, -1] 来计算每个样本的max
+    edge_flat = edge_strength.view(B, -1)
+    # 使用max而不是quantile，快得多！
+    upper = edge_flat.max(dim=1, keepdim=True)[0] * 0.98  # [B, 1]
+    # 扩展维度以匹配原始shape
+    upper = upper.view(B, 1, 1, 1)
+
+    # 向量化操作，不用循环
+    edge_clamped = torch.clamp(edge_strength, min=0.0)
+    edge_normalized = torch.minimum(edge_clamped, upper) / (upper + 1e-8)
 
     return edge_normalized
 
@@ -272,6 +278,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
         epe_edge = epe[is_edge] if is_edge.sum() > 0 else epe_all
         epe_flat = epe[is_flat] if is_flat.sum() > 0 else epe_all
 
+        d1 = (epe_all > 3).float().mean().item()  # D1: >3px error rate
         metrics = {
             'epe': epe_all.mean().item(),
             'epe_edge': epe_edge.mean().item(),
@@ -279,6 +286,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
             '1px': (epe_all < 1).float().mean().item(),
             '3px': (epe_all < 3).float().mean().item(),
             '5px': (epe_all < 5).float().mean().item(),
+            'd1': d1,
         }
         return disp_loss, metrics
     else:
@@ -303,6 +311,7 @@ class Logger:
         self.total_steps = 0
         self.running_loss = {}
         self.writer = SummaryWriter(log_dir=logdir)
+        self.last_train_metrics = {}  # 保存最近的train metrics用于validation时打印
 
     def _print_training_status(self, edge_scale=None):
         avg_metrics = {k: self.running_loss[k]/Logger.SUM_FREQ for k in self.running_loss}
@@ -340,6 +349,10 @@ class Logger:
 
             self.running_loss[key] += metrics[key]
 
+        # 保存最近的train metrics用于validation时打印
+        self.last_train_metrics = metrics.copy()
+        self.last_edge_scale = edge_scale
+
         if self.total_steps % Logger.SUM_FREQ == Logger.SUM_FREQ-1:
             self._print_training_status(edge_scale)
             self.running_loss = {}
@@ -351,6 +364,39 @@ class Logger:
         # 为validation结果添加 "val/" 前缀，便于TensorBoard区分
         for key in results:
             self.writer.add_scalar(f"val/{key}", results[key], self.total_steps)
+
+    def print_train_val_comparison(self, val_results):
+        """打印Train和Val的对比结果"""
+        print("\n" + "="*80)
+        edge_scale_str = f" | EdgeScale: {getattr(self, 'last_edge_scale', 0):.2f}" if hasattr(self, 'last_edge_scale') and self.last_edge_scale else ""
+        print(f"[Ours EdgeWeight] Step: {self.total_steps:>6d} - Train vs Val Comparison{edge_scale_str}")
+        print("="*80)
+
+        # 获取train metrics
+        train_loss = self.last_train_metrics.get('loss', 0)
+        train_epe = self.last_train_metrics.get('epe', 0)
+        train_d1 = self.last_train_metrics.get('d1', 0) * 100  # 转为百分比
+
+        # 获取val metrics (根据dataset不同key不同)
+        val_epe = val_results.get('scene-disp-epe', val_results.get('kitti-epe', 0))
+        val_d1 = val_results.get('scene-disp-d1', val_results.get('kitti-d1', 0))
+
+        print(f"{'Metric':<15} {'Train':>12} {'Val':>12}")
+        print("-"*40)
+        print(f"{'Loss':<15} {train_loss:>12.4f} {'N/A':>12}")
+        print(f"{'EPE':<15} {train_epe:>12.4f} {val_epe:>12.4f}")
+        print(f"{'D1 (>3px)':<15} {train_d1:>11.2f}% {val_d1:>11.2f}%")
+
+        # 如果有edge/flat EPE也打印出来
+        if 'epe_edge' in self.last_train_metrics:
+            train_epe_edge = self.last_train_metrics.get('epe_edge', 0)
+            train_epe_flat = self.last_train_metrics.get('epe_flat', 0)
+            val_epe_edge = val_results.get('scene-disp-epe-edge', 0)
+            val_epe_flat = val_results.get('scene-disp-epe-flat', 0)
+            print(f"{'EPE_edge':<15} {train_epe_edge:>12.4f} {val_epe_edge:>12.4f}")
+            print(f"{'EPE_flat':<15} {train_epe_flat:>12.4f} {val_epe_flat:>12.4f}")
+
+        print("="*80 + "\n")
 
     def close(self):
         self.writer.close()
@@ -471,6 +517,9 @@ def train(args):
                     raise Exception('Unknown validation dataset.')
                 logger.write_dict(results)
 
+                # 打印Train vs Val对比
+                logger.print_train_val_comparison(results)
+
                 # 根据EPE保存最优checkpoint
                 current_epe = results.get('scene-disp-epe', results.get('kitti-epe', float('inf')))
                 if current_epe < best_epe:
@@ -505,17 +554,23 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/ours_edge_weight', help='the directory to save logs and checkpoints')
 
     # Training parameters - 默认快速测试配置
-    parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
+    # (注：根据你实际显存情况调整，能开到 8 最好，开不到就 4 + Gradient Accumulation)
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
-    parser.add_argument('--image_size', type=int, nargs='+', default=[256, 448], help="size of the random image crops used during training.")
-    parser.add_argument('--train_iters', type=int, default=8, help="number of updates to the disparity field in each forward pass.")
+    # 如果你是单卡 32G V100，配合上述改回的 size 和 iters，可能只能跑 2 或 4。
+    # 建议：如果改回 320x736 和 22 iters 后 OOM，优先降低 Batch Size 到 4，而不是降低 iters 或 size。
+    parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
+    # 标准 SceneFlow 训练尺寸是 [320, 736]。
+    # 如果显存吃紧，可以折中改为 [320, 640] 或 [288, 576]，但 256x448 确实太小了。
+    parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736],
+                        help="size of the random image crops used during training.")
+    parser.add_argument('--train_iters', type=int, default=22, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
     # Validation parameters
-    parser.add_argument('--valid_freq', type=int, default=200, help='validation frequency (steps)')
-    parser.add_argument('--valid_iters', type=int, default=16, help='number of disp-field updates during validation forward pass')
+    parser.add_argument('--valid_freq', type=int, default=100, help='validation frequency (steps)')
+    parser.add_argument('--valid_iters', type=int, default=32, help='number of disp-field updates during validation forward pass')
     parser.add_argument('--val_samples', type=int, default=100, help='number of samples to validate (0 for all)')
 
     # Architecure choices
@@ -524,7 +579,8 @@ if __name__ == '__main__':
     parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
-    parser.add_argument('--max_disp', type=int, default=128, help="max disp of geometry encoding volume")
+    # 标准设置为 192。这对于 SceneFlow 是必须的。
+    parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
 
     # Data augmentation
     parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")
@@ -536,7 +592,7 @@ if __name__ == '__main__':
     # Edge-weighted loss parameters
     parser.add_argument('--edge_scale', type=float, default=2.0,
                         help='Initial edge weight scale factor. Final weight = 1.0 + edge_scale * edge_strength')
-    parser.add_argument('--edge_scale_mode', type=str, default='fixed',
+    parser.add_argument('--edge_scale_mode', type=str, default='schedule',
                         choices=['fixed', 'schedule', 'adaptive'],
                         help='Edge scale mode: fixed (constant), schedule (warmup), adaptive (EPE-driven)')
     parser.add_argument('--edge_scale_min', type=float, default=0.5,
