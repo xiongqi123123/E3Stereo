@@ -1,2 +1,10 @@
 /IGEV/checkpoints/
 /.claude/
+/test/output/
+*.png
+*.pdf
+*.json
+*.txt
+.idea/
+*.xml
+/test/output/
