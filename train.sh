@@ -1,4 +1,4 @@
-name=estero-gt-edge-guided-disp-head-film
+name=estero-gt-edge-weight-epe-0.1
 restore_ckpt=None
 logdir=./checkpoints/$name
 batch_size=4
@@ -16,7 +16,7 @@ python train_stereo.py \
     --lr $lr \
     --num_steps $num_steps \
     --edge_source gt --edge_model None \
-    --edge_guided_disp_head --edge_disp_fusion_mode film 
+    --edge_weight_epe_weight 0.1
 
 # --edge_source gt --edge_model None                # Edge 来源: 'gt' 使用外部读取的 gt edge (如 gtedge.py 预生成)
 # --edge_context_fusion --edge_fusion_mode film       # Edge 融合到 Context
