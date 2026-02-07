@@ -242,7 +242,8 @@ def generate_edge_map(disp_path, output_path='edge_visualization.png', patch_siz
 
 if __name__ == '__main__':
     # 替换为你实际的 GT 视差图路径
-    test_path = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/disparity/TRAIN/A/0130/left/0015.pfm'
+    # test_path = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/disparity/TRAIN/A/0130/left/0015.pfm'
+    test_path = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/disparity/TRAIN/A/0004/left/0012.pfm'
 
     if os.path.exists(test_path):
         generate_edge_map(test_path)

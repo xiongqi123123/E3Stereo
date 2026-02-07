@@ -360,6 +360,7 @@ Flat EPE: {epe_flat:.4f}"""
 
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches='tight', dpi=150)
+    plt.show()
     plt.close()
 
     print(f"误差分析图已保存至: {output_path}")
@@ -382,7 +383,8 @@ def main():
                         # default='/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/frames_finalpass/TRAIN/A/0130/left/0015.png',
                         # default='/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/frames_finalpass/TRAIN/A/0230/left/0015.png',
                         # default='/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/frames_finalpass/TRAIN/A/0030/left/0015.png',
-                        default=None,
+                        default='/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/frames_finalpass/TRAIN/A/0004/left/0012.png',
+                        # default=None,
                         help='Direct path to left image (auto-infers right and GT)')
     parser.add_argument('--data_root', type=str,
                         default='/root/autodl-tmp/stereo/dataset_cache',

@@ -456,6 +456,12 @@ def train(args):
     ckpt_output_dir.mkdir(exist_ok=True, parents=True)
     logging.info(f"Best checkpoints will be saved to: {ckpt_output_dir}")
 
+    # 梯度累加相关
+    accumulation_counter = 0
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    logging.info(f"Gradient accumulation: {args.gradient_accumulation_steps} steps")
+    logging.info(f"Effective batch size: {effective_batch_size} (batch_size {args.batch_size} × {args.gradient_accumulation_steps})")
+
     # 使用 tqdm 显示总训练步数进度
     pbar = tqdm(total=args.num_steps, desc="Training", dynamic_ncols=True)
 
@@ -463,7 +469,7 @@ def train(args):
         for i_batch, (_, *data_blob) in enumerate(train_loader):
             if total_steps >= args.num_steps:
                 break
-            optimizer.zero_grad()
+
             image1, image2, disp_gt, valid = [x.to(args.device) for x in data_blob]
 
             # 从左图提取边缘 map
@@ -493,25 +499,37 @@ def train(args):
                     flat_epe=metrics['epe_flat']
                 )
 
+            # 梯度累加：将loss除以累加步数
+            loss = loss / args.gradient_accumulation_steps
+
             global_batch_num += 1
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            scaler.step(optimizer)
-            scheduler.step()
-            scaler.update()
+            accumulation_counter += 1
 
-            # 更新进度条
+            # 只在累加步数达到时才更新参数
+            if accumulation_counter >= args.gradient_accumulation_steps:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                scaler.step(optimizer)
+                scheduler.step()
+                scaler.update()
+
+                optimizer.zero_grad()
+                accumulation_counter = 0
+
+            # 更新进度条（显示原始loss，乘回来）
             pbar.update(1)
             pbar.set_postfix({
-                'Loss': f"{loss.item():.3f}",
-                'Scale': f"{current_edge_scale:.2f}"
+                'Loss': f"{loss.item() * args.gradient_accumulation_steps:.3f}",
+                'Scale': f"{current_edge_scale:.2f}",
+                'AccumStep': f"{accumulation_counter}/{args.gradient_accumulation_steps}"
             })
 
-            # 只在计算了metrics时更新logger
+            # 只在计算了metrics时更新logger（记录原始loss）
             if metrics is not None:
-                metrics['loss'] = loss.item()
+                metrics['loss'] = loss.item() * args.gradient_accumulation_steps
                 logger.push(metrics, current_edge_scale)
 
             if total_steps > 0 and total_steps % args.valid_freq == 0:
@@ -556,32 +574,35 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default='igev-stereo', help="name your experiment")
+    parser.add_argument('--name', default='edge_d1_26', help="name your experiment")
     parser.add_argument('--restore_ckpt',
-                        # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
+                        #default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
+                        # default='/root/autodl-tmp/stereo/logs/ckpt_output/igev-stereo_best_epe1.2078_step24500.pth',
                         default=None,
                         help="load the weights from a specific checkpoint")
-    parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
-    parser.add_argument('--precision_dtype', default='float16', choices=['float16', 'bfloat16', 'float32'], help='Choose precision type: float16 or bfloat16 or float32')
-    parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/ours_edge_weight', help='the directory to save logs and checkpoints')
-
-    # Training parameters - 默认快速测试配置
-    # (注：根据你实际显存情况调整，能开到 8 最好，开不到就 4 + Gradient Accumulation)
-    parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
+    parser.add_argument('--use_constant_lr', action='store_true')
     parser.add_argument('--num_steps', type=int, default=25000, help="length of training schedule.")
-    parser.add_argument('--use_constant_lr', action='store_true',
-                        help='Use constant LR instead of OneCycleLR (recommended for quick verification from pretrained weights)')
-    # 如果你是单卡 32G V100，配合上述改回的 size 和 iters，可能只能跑 2 或 4。
-    # 建议：如果改回 320x736 和 22 iters 后 OOM，优先降低 Batch Size 到 4，而不是降低 iters 或 size。
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=2,
+                        help="number of gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)")
     # 标准 SceneFlow 训练尺寸是 [320, 736]。
     # 如果显存吃紧，可以折中改为 [320, 640] 或 [288, 576]，但 256x448 确实太小了。
     parser.add_argument('--image_size', type=int, nargs='+', default=[256, 512],
                         help="size of the random image crops used during training.")
-    parser.add_argument('--train_iters', type=int, default=12, help="number of updates to the disparity field in each forward pass.")
-    parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
+    parser.add_argument('--train_iters', type=int, default=12,
+                        help="number of updates to the disparity field in each forward pass.")
 
+
+    parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
+    parser.add_argument('--precision_dtype', default='float16', choices=['float16', 'bfloat16', 'float32'],
+                        help='Choose precision type: float16 or bfloat16 or float32')
+    parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/edge_d1_26', help='the directory to save logs and checkpoints')
+
+    # Training parameters - 默认快速测试配置
+    # (注：根据你实际显存情况调整，能开到 8 最好，开不到就 4 + Gradient Accumulation)
+    parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
+    parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
     # Validation parameters
     parser.add_argument('--valid_freq', type=int, default=500, help='validation frequency (steps)')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of disp-field updates during validation forward pass')

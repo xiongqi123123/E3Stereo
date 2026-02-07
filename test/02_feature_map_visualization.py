@@ -139,4 +139,6 @@ if __name__ == '__main__':
     # IMG_PATH = '/root/autodl-tmp/stereo/dataset_cache/KITTI/KITTI_2012/training/image_0/000192_10.png'
     # IMG_PATH = '/root/autodl-tmp/stereo/dataset_cache/KITTI/KITTI_2012/training/disp_occ/000192_10.png'
     IMG_PATH = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/frames_finalpass/TRAIN/A/0130/left/0015.png'
+    IMG_PATH = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/frames_finalpass/TRAIN/A/0004/left/0012.png'
+    # test_path = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/disparity/TRAIN/A/0004/left/0012.pfm'
     visualize_features(CKPT_PATH, IMG_PATH)
