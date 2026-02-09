@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from igev_stereo import IGEVStereo
-from evaluate_stereo import *
+from evaluate_stereo_pix import *
 import stereo_datasets as datasets
 import torch.nn.functional as F
 try:
@@ -148,12 +148,12 @@ class AdaptiveEdgeScale:
             return self.current_scale
 
         elif self.mode == 'schedule':
-            # Warmup: 从 min_scale 线性增加到 max_scale
+            # Warmup: 从 min_scale 线性增加到 init_scale
             if step < self.warmup_steps:
                 progress = step / self.warmup_steps
-                self.current_scale = self.min_scale + progress * (self.max_scale - self.min_scale)
+                self.current_scale = self.min_scale + progress * (self.init_scale - self.min_scale)
             else:
-                self.current_scale = self.max_scale
+                self.current_scale = self.init_scale
             return self.current_scale
 
         elif self.mode == 'adaptive':
@@ -199,9 +199,10 @@ class AdaptiveEdgeScale:
 
 
 def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
-                  loss_gamma=0.9, max_disp=192, edge_scale=2.0, compute_metrics=False):
+                  loss_gamma=0.9, max_disp=192, edge_scale=2.0, compute_metrics=False,
+                  multiscale_edge=False):
     """
-    带边缘加权的序列损失函数
+    带边缘加权的序列损失函数（支持多尺度边缘监督）
     Args:
         disp_preds: 迭代预测的视差列表
         disp_init_pred: 初始视差预测
@@ -210,22 +211,41 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
         edge_map: 边缘强度图 [B, 1, H, W]，范围 [0, 1]
         loss_gamma: 损失衰减系数
         max_disp: 最大视差
-        edge_scale: 边缘权重缩放因子
+        edge_scale: 边缘权重缩放因子（基础值）
         compute_metrics: 是否计算详细metrics（默认False，只在需要打印时才计算）
+        multiscale_edge: 是否使用多尺度边缘监督（不同iter使用不同edge_scale）
     """
     n_predictions = len(disp_preds)
     mag = torch.sum(disp_gt ** 2, dim=1).sqrt()
     # 过滤无效区域
     valid_mask = (valid >= 0.5) & (mag < max_disp)
 
-    # 自适应权重：基于边缘强度的连续权重
-    # weight = 1.0 + edge_scale * edge_strength
-    # 边缘强度为 0 时权重为 1，边缘强度为 1 时权重为 1 + edge_scale
-    pixel_weights = compute_adaptive_weight(edge_map, base_weight=1.0, edge_scale=edge_scale)
+    # 多尺度边缘监督策略
+    if multiscale_edge:
+        # 定义多尺度策略函数：早期iter用小权重，后期iter用大权重
+        # 将32个iter分为3个阶段：early (0-10), middle (11-23), late (24-31)
+        def get_scale_for_iter(iter_idx, base_scale):
+            """
+            根据iter索引返回相应的edge_scale
+            Fine-to-coarse策略（反向）：
+            - Early (0-10): 1.5x base_scale (早期强化边缘学习)
+            - Middle (11-23): 1.0x base_scale (中期标准权重)
+            - Late (24-31): 0.7x base_scale (后期允许平衡edge和flat)
 
-    # 确保维度匹配：pixel_weights [B, 1, H, W] -> [B, H, W]
-    if pixel_weights.dim() == 4:
-        pixel_weights = pixel_weights.squeeze(1)
+            理由：GRU迭代refinement中，早期预测是基础，早期强化边缘
+            可以让模型从一开始就学习到边缘特征，避免后期难以纠正
+            """
+            if iter_idx < 11:  # early stage
+                return base_scale * 1.5  # 早期强化边缘
+            elif iter_idx < 24:  # middle stage
+                return base_scale * 1.0  # 中期标准
+            else:  # late stage
+                return base_scale * 0.7  # 后期放松
+
+    # 为初始视差计算权重（使用基础edge_scale）
+    pixel_weights_init = compute_adaptive_weight(edge_map, base_weight=1.0, edge_scale=edge_scale)
+    if pixel_weights_init.dim() == 4:
+        pixel_weights_init = pixel_weights_init.squeeze(1)
 
     # 辅助函数：计算加权 Loss
     def weighted_l1(pred, gt, weights, mask):
@@ -243,13 +263,23 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, edge_map,
 
     disp_loss = 0.0
 
-    # 初始视差 Loss
-    disp_loss += 1.0 * weighted_l1(disp_init_pred, disp_gt, pixel_weights, valid_mask)
+    # 初始视差 Loss（使用基础edge_scale）
+    disp_loss += 1.0 * weighted_l1(disp_init_pred, disp_gt, pixel_weights_init, valid_mask)
 
     # 迭代 Loss
     for i in range(n_predictions):
         adjusted_loss_gamma = loss_gamma ** (15 / (n_predictions - 1))
         i_weight = adjusted_loss_gamma ** (n_predictions - i - 1)
+
+        # 根据是否使用多尺度，动态调整当前iter的pixel_weights
+        if multiscale_edge:
+            current_edge_scale = get_scale_for_iter(i, edge_scale)
+            pixel_weights = compute_adaptive_weight(edge_map, base_weight=1.0, edge_scale=current_edge_scale)
+            if pixel_weights.dim() == 4:
+                pixel_weights = pixel_weights.squeeze(1)
+        else:
+            # 单尺度：所有iter使用相同的edge_scale
+            pixel_weights = pixel_weights_init
 
         pred_i = disp_preds[i]
         if pred_i.dim() == 4:
@@ -502,7 +532,8 @@ def train(args):
             loss, metrics = sequence_loss(
                 disp_preds, disp_init_pred, disp_gt, valid, edge_map,
                 max_disp=args.max_disp, edge_scale=current_edge_scale,
-                compute_metrics=should_log
+                compute_metrics=should_log,
+                multiscale_edge=args.multiscale_edge
             )
 
             # 如果计算了metrics，更新adaptive edge_scale
@@ -588,15 +619,15 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default='edge_d1_26', help="name your experiment")
+    parser.add_argument('--name', default='igev-stereo', help="name your experiment")
     parser.add_argument('--restore_ckpt',
-                        #default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
+                        # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
                         # default='/root/autodl-tmp/stereo/logs/ckpt_output/igev-stereo_best_epe1.2078_step24500.pth',
                         default=None,
                         help="load the weights from a specific checkpoint")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--use_constant_lr', action='store_true')
-    parser.add_argument('--num_steps', type=int, default=500000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=25000, help="length of training schedule.")
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2,
                         help="number of gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)")
@@ -609,18 +640,18 @@ if __name__ == '__main__':
 
 
     parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
-    parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'bfloat16', 'float32'],
+    parser.add_argument('--precision_dtype', default='float16', choices=['float16', 'bfloat16', 'float32'],
                         help='Choose precision type: float16 or bfloat16 or float32')
-    parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/edge_d1_26', help='the directory to save logs and checkpoints')
+    parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/ours_edge_weight', help='the directory to save logs and checkpoints')
 
     # Training parameters - 默认快速测试配置
     # (注：根据你实际显存情况调整，能开到 8 最好，开不到就 4 + Gradient Accumulation)
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
     # Validation parameters
-    parser.add_argument('--valid_freq', type=int, default=1000, help='validation frequency (steps)')
+    parser.add_argument('--valid_freq', type=int, default=500, help='validation frequency (steps)')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of disp-field updates during validation forward pass')
-    parser.add_argument('--val_samples', type=int, default=1000, help='number of samples to validate (0 for all)')
+    parser.add_argument('--val_samples', type=int, default=100, help='number of samples to validate (0 for all)')
 
     # Architecure choices
     parser.add_argument('--corr_levels', type=int, default=2, help="number of levels in the correlation pyramid")
@@ -639,21 +670,23 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
 
     # Edge-weighted loss parameters
-    parser.add_argument('--edge_scale', type=float, default=2.0,
+    parser.add_argument('--edge_scale', type=float, default=5.0,
                         help='Initial edge weight scale factor. Final weight = 1.0 + edge_scale * edge_strength')
     parser.add_argument('--edge_scale_mode', type=str, default='schedule',
                         choices=['fixed', 'schedule', 'adaptive'],
                         help='Edge scale mode: fixed (constant), schedule (warmup), adaptive (EPE-driven)')
-    parser.add_argument('--edge_scale_min', type=float, default=0.5,
+    parser.add_argument('--edge_scale_min', type=float, default=1.0,
                         help='Minimum edge scale (for schedule/adaptive modes)')
-    parser.add_argument('--edge_scale_max', type=float, default=2.0,
+    parser.add_argument('--edge_scale_max', type=float, default=5.0,
                         help='Maximum edge scale (for schedule/adaptive modes)')
     parser.add_argument('--edge_warmup_steps', type=int, default=5000,
                         help='Warmup steps for schedule mode')
     parser.add_argument('--edge_target_ratio', type=float, default=1.5,
                         help='Target edge_EPE/flat_EPE ratio for adaptive mode')
-    parser.add_argument('--edge_adjustment_rate', type=float, default=0.01,
+    parser.add_argument('--edge_adjustment_rate', type=float, default=0.05,
                         help='Adjustment rate for adaptive mode')
+    parser.add_argument('--multiscale_edge', action='store_true',
+                        help='Use multi-scale edge supervision (different edge_scale for different iters)')
 
     # Dataset paths
     parser.add_argument('--dataset_root', type=str, default='/root/autodl-tmp/stereo/dataset_cache', help='root directory for all datasets')
