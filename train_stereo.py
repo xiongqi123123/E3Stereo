@@ -12,6 +12,7 @@ from core.igev_stereo import IGEVStereo
 from evaluate_stereo import *
 import core.stereo_datasets as datasets
 import torch.nn.functional as F
+import datetime
 try:
     from torch.cuda.amp import GradScaler
 except:
@@ -28,59 +29,8 @@ except:
             pass
 
 
-def edge_weighted_epe_loss(disp_pred, disp_gt, edge, valid, eps=1e-6):
-    """
-    Edge-weighted EPE: 在边界处提高 EPE 权重，使模型更关注边界精度。
-    weight = 1 + edge，即边缘处 weight→2，平坦区 weight→1。
-    """
-    if edge is None:
-        return disp_pred.new_zeros(1)
-    edge = edge.clamp(0.0, 1.0)
-    if edge.dim() == 3:
-        edge = edge.unsqueeze(1)
-    if edge.shape[2:] != disp_pred.shape[2:]:
-        edge = F.interpolate(edge, size=disp_pred.shape[2:], mode='bilinear', align_corners=False)
-    weight = (1.0 + edge).clamp(eps, 10.0)
-    epe = (disp_pred - disp_gt).abs()
-    if valid is not None:
-        if valid.shape[2:] != disp_pred.shape[2:]:
-            valid = F.interpolate(valid.float(), size=disp_pred.shape[2:], mode='nearest')
-        mask = valid.bool() if valid.dtype == torch.bool else (valid > 0.5)
-        if mask.any():
-            return (weight * epe)[mask].mean()
-        return disp_pred.new_zeros(1)
-    return (weight * epe).mean()
-
-
-def edge_aware_smoothness_loss(disp, edge, valid=None, eps=1e-6):
-    """
-    Edge-aware smoothness: 在非边缘区域鼓励视差平滑，在边缘处允许视差突变。
-    weight = 1 - edge，即边缘处 weight→0 不惩罚梯度，平坦区 weight→1 强惩罚。
-    """
-    if edge is None:
-        return disp.new_zeros(1)
-    edge = edge.clamp(0.0, 1.0)
-    dx = disp[:, :, :, 1:] - disp[:, :, :, :-1]
-    dy = disp[:, :, 1:, :] - disp[:, :, :-1, :]
-    wx = (1.0 - edge[:, :, :, :-1]).clamp(eps, 1.0)
-    wy = (1.0 - edge[:, :, :-1, :]).clamp(eps, 1.0)
-    if valid is not None:
-        valid_x = (valid[:, :, :, 1:] * valid[:, :, :, :-1]).bool()
-        valid_y = (valid[:, :, 1:, :] * valid[:, :, :-1, :]).bool()
-        if valid_x.any():
-            loss_x = (wx * dx.abs())[valid_x].mean()
-        else:
-            loss_x = disp.new_zeros(1)
-        if valid_y.any():
-            loss_y = (wy * dy.abs())[valid_y].mean()
-        else:
-            loss_y = disp.new_zeros(1)
-        return loss_x + loss_y
-    return (wx * dx.abs()).mean() + (wy * dy.abs()).mean()
-
-
 def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, max_disp=192,
-                  edge=None, edge_smoothness_weight=0.0, edge_weight_epe_weight=0.0):
+                  edge=None):
     """ Loss function defined over sequence of disp predictions """
 
     n_predictions = len(disp_preds)
@@ -99,45 +49,35 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, ma
         assert i_loss.shape == valid_mask.shape, [i_loss.shape, valid_mask.shape, disp_gt.shape, disp_preds[i].shape]
         disp_loss += i_weight * i_loss[valid_mask.bool()].mean()
 
-    # Edge-weighted EPE: 在边界处提高 EPE 权重，使模型更关注边界精度（仅当 weight>0 时施加）
-    edge_epe_loss = None
-    if edge_weight_epe_weight > 0 and edge is not None:
-        edge_epe = edge
-        if edge_epe.dim() == 3:
-            edge_epe = edge_epe.unsqueeze(1)
-        if edge_epe.shape[2:] != disp_preds[-1].shape[2:]:
-            edge_epe = F.interpolate(edge_epe, size=disp_preds[-1].shape[2:], mode='bilinear', align_corners=False)
-        valid_epe = valid_mask.float() if valid_mask.shape[2:] == disp_preds[-1].shape[2:] else \
-            F.interpolate(valid_mask.float(), size=disp_preds[-1].shape[2:], mode='nearest')
-        edge_epe_loss = edge_weighted_epe_loss(disp_preds[-1], disp_gt, edge_epe, valid_epe)
-        disp_loss = disp_loss + edge_weight_epe_weight * edge_epe_loss
+    epe_map = torch.sum((disp_preds[-1] - disp_gt)**2, dim=1).sqrt().unsqueeze(1)  # [B, 1, H, W]
+    epe_flat_all = epe_map.view(-1)[valid_mask.view(-1)]
 
-    # Edge-aware smoothness: 仅对最终预测施加，在边界处允许视差突变
-    smooth_loss = None
-    if edge_smoothness_weight > 0 and edge is not None:
-        edge_smooth = edge
-        if edge_smooth.dim() == 3:
-            edge_smooth = edge_smooth.unsqueeze(1)
-        if edge_smooth.shape[2:] != disp_preds[-1].shape[2:]:
-            edge_smooth = F.interpolate(edge_smooth, size=disp_preds[-1].shape[2:], mode='bilinear', align_corners=False)
-        valid_smooth = valid_mask.float() if valid_mask.shape[2:] == disp_preds[-1].shape[2:] else \
-            F.interpolate(valid_mask.float(), size=disp_preds[-1].shape[2:], mode='nearest')
-        smooth_loss = edge_aware_smoothness_loss(disp_preds[-1], edge_smooth, valid_smooth)
-        disp_loss = disp_loss + edge_smoothness_weight * smooth_loss
-
-    epe = torch.sum((disp_preds[-1] - disp_gt)**2, dim=1).sqrt()
-    epe = epe.view(-1)[valid_mask.view(-1)]
-
+    # 先初始化 metrics，把 edge/flat 的 key 固定加入，保证日志里总会有这两个字段
     metrics = {
-        'epe': epe.mean().item(),
-        '1px': (epe < 1).float().mean().item(),
-        '3px': (epe < 3).float().mean().item(),
-        '5px': (epe < 5).float().mean().item(),
+        'epe': epe_flat_all.mean().item(),
+        '1px': (epe_flat_all < 1).float().mean().item(),
+        '3px': (epe_flat_all < 3).float().mean().item(),
+        '5px': (epe_flat_all < 5).float().mean().item(),
+        'epe_edge': 0.0,  # 默认 0，如果当前 batch 没有 edge 像素就保持为 0
+        'epe_flat': 0.0,  # 默认 0，后面会用真实 flat 区域的 EPE 覆盖
     }
-    if smooth_loss is not None:
-        metrics['edge_smooth'] = smooth_loss.item()
-    if edge_epe_loss is not None:
-        metrics['edge_epe'] = edge_epe_loss.item()
+
+    # 若有 edge，分别统计 edge 区域和 flat 区域的 EPE
+    if edge is not None:
+        if edge.shape[-2:] != valid_mask.shape[-2:]:
+            edge = F.interpolate(edge.float(), size=valid_mask.shape[-2:], mode='bilinear', align_corners=False)
+
+        edge_mask = (edge > 0.5) & valid_mask
+        flat_mask = (~(edge > 0.5)) & valid_mask
+
+        if edge_mask.any():
+            epe_edge = epe_map[edge_mask].view(-1)
+            metrics['epe_edge'] = epe_edge.mean().item()
+        # 一般 flat 区域总是存在，这里仍然做一下保护
+        if flat_mask.any():
+            epe_flat = epe_map[flat_mask].view(-1)
+            metrics['epe_flat'] = epe_flat.mean().item()
+
     return disp_loss, metrics
 
 def fetch_optimizer(args, model):
@@ -158,12 +98,13 @@ class Logger:
         self.writer = SummaryWriter(log_dir=args.logdir)
 
     def _print_training_status(self):
-        metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in sorted(self.running_loss.keys())]
+        keys = sorted(self.running_loss.keys())
+        metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in keys]
         training_str = "[{:6d}, {:10.7f}] ".format(self.total_steps+1, self.scheduler.get_last_lr()[0])
-        metrics_str = ("{:10.4f}, "*len(metrics_data)).format(*metrics_data)
+        metrics_str = " ".join(f"{k}={v:.4f}" for k, v in zip(keys, metrics_data))
         
         # print the training status
-        logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
+        logging.info(f"Training Metrics ({self.total_steps}): {training_str}{metrics_str}")
 
         if self.writer is None:
             self.writer = SummaryWriter(log_dir=args.logdir)
@@ -237,14 +178,13 @@ def train(args):
             assert model.training
             disp_init_pred, disp_preds, left_edge_out = model(image1, image2, iters=args.train_iters, left_edge=left_edge)
             assert model.training
-            # left_edge_out: 模型内部计算的 edge (rcf) 或传入的 edge (gt)，用于 edge_aware_smoothness
-            edge_for_smooth = left_edge_out if left_edge_out is not None else left_edge
+            # edge_for_metrics: 用 dataset 原始 edge (0/1) 做 epe_edge/epe_flat 统计，避免模型内部 edge_scale 缩放后 edge>0.5 的 mask 为空
+            # 当 dataset 无 edge (如 edge_source=rcf) 时退化为 left_edge_out
+            edge_for_metrics = left_edge if left_edge is not None else left_edge_out
 
             loss, metrics = sequence_loss(
                 disp_preds, disp_init_pred, disp_gt, valid, max_disp=args.max_disp,
-                edge=edge_for_smooth if (getattr(args, 'edge_aware_smoothness', False) or getattr(args, 'edge_weight_epe_weight', 0.0) > 0) else None,
-                edge_smoothness_weight=getattr(args, 'edge_smoothness_weight', 0.0),
-                edge_weight_epe_weight=getattr(args, 'edge_weight_epe_weight', 0.0),
+                edge=edge_for_metrics,
             )
             logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
@@ -322,9 +262,9 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
     
     # Edge augmentation (需配合 edge_model 使用)
-    parser.add_argument('--edge_source', type=str, default='rcf', choices=['rcf', 'gt'],
+    parser.add_argument('--edge_source', type=str, default=None, choices=['rcf', 'gt'],
                         help="edge source: 'rcf' use RCF online prediction, 'gt' use gtedge pre-generated edge.")
-    parser.add_argument('--edge_model', type=str, default='../RCF-PyTorch/rcf.pth',
+    parser.add_argument('--edge_model', type=str, default=None,
                         help='path to the edge model (当 edge_source=rcf 且开启任意 edge_* 时必需)')
     parser.add_argument('--edge_context_fusion', action='store_true',
                         help='fuse edge into context features for GRU input')
@@ -363,20 +303,14 @@ if __name__ == '__main__':
     parser.add_argument('--edge_refinement_fusion_mode', type=str, default='film',
                         choices=['concat', 'film', 'gated'],
                         help='edge-refinement fusion: concat/film/gated')
-    parser.add_argument('--edge_aware_smoothness', action='store_true',
-                        help='add edge-aware smoothness loss: smooth in flat regions, allow discontinuity at edges')
-    parser.add_argument('--edge_smoothness_weight', type=float, default=0.05,
-                        help='weight for edge-aware smoothness loss (default 0.05)')
-    parser.add_argument('--edge_weight_epe_weight', type=float, default=0.0,
-                        help='weight for edge-weighted EPE loss, 0=disabled (default 0.0)')
     args = parser.parse_args()
 
     torch.manual_seed(666)
     np.random.seed(666)
-    
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
 
     Path(args.logdir).mkdir(exist_ok=True, parents=True)
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+                        filename=f"{args.logdir}/train{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
     train(args)

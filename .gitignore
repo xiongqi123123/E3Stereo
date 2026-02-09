@@ -2,3 +2,5 @@ checkpoints/
 __pycache__/
 *.txt
 test/
+eval_edge_vis/
+model/

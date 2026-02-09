@@ -130,6 +130,7 @@ def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
     val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True, edge_source=edge_source)
 
     out_list, epe_list = [], []
+    epe_edge_list, epe_flat_list = [], []
     for val_id in tqdm(range(len(val_dataset))):
         data_item = val_dataset[val_id]
         # 数据可能包含 edge（如果 edge_source='gt'）
@@ -166,8 +167,17 @@ def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
         out = (epe > 3.0)
         epe_list.append(epe[val].mean().item())
         out_list.append(out[val].cpu().numpy())
-        # if val_id == 400:
-        #     break
+
+        # 若有 GT edge，分别统计 edge 与 flat 区域的 EPE
+        if left_edge is not None:
+            edge_flat = left_edge.cpu().squeeze().flatten()
+            if edge_flat.shape[0] == epe.shape[0]:
+                edge_val = val & (edge_flat > 0.5)
+                flat_val = val & (edge_flat <= 0.5)
+                if edge_val.any():
+                    epe_edge_list.append(epe[edge_val].mean().item())
+                if flat_val.any():
+                    epe_flat_list.append(epe[flat_val].mean().item())
 
     epe_list = np.array(epe_list)
     out_list = np.concatenate(out_list)
@@ -194,8 +204,17 @@ def validate_sceneflow(model, iters=32, mixed_prec=False, args=None):
         f = open('test/test.txt', 'a')
     f.write("Validation Scene Flow: %f, %f\n" % (epe, d1))
 
-    print("Validation Scene Flow: %f, %f" % (epe, d1))
-    return {'scene-disp-epe': epe, 'scene-disp-d1': d1}
+    results = {'scene-disp-epe': epe, 'scene-disp-d1': d1}
+    print("Validation Scene Flow: EPE %f, D1 %f" % (epe, d1))
+    if len(epe_edge_list) > 0:
+        epe_edge = np.mean(epe_edge_list)
+        print("  EPE (edge): %f" % epe_edge)
+        results['scene-disp-epe-edge'] = epe_edge
+    if len(epe_flat_list) > 0:
+        epe_flat = np.mean(epe_flat_list)
+        print("  EPE (flat): %f" % epe_flat)
+        results['scene-disp-epe-flat'] = epe_flat
+    return results
 
 
 @torch.no_grad()
