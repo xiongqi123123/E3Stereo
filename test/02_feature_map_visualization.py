@@ -1,3 +1,15 @@
+"""
+● Context Feature vs Edge：
+  - Edge：用 Sobel 算子从 RGB 图像提取的边缘强度图，仅用于训练时统计 edge/flat 区域的 EPE（误差评估），不参与网络
+  - Context Feature：网络学习的语义特征，包含纹理、边缘、物体等高级语义信息，用于后续 GRU 更新
+
+  Context Feature 维度：
+  - 128 通道（从 args.hidden_dims=[128]*3 得出）
+  - 空间分辨率是原图的 1/4（outputs04）
+  颜色含义（JET colormap）：
+  - 红色：高特征响应（网络认为该区域重要，如边缘、纹理丰富区域）
+  - 蓝色：低特征响应（平坦、无纹理区域）
+"""
 import torch
 import torch.nn as nn
 import numpy as np

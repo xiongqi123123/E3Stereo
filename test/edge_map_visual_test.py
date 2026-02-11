@@ -1,3 +1,8 @@
+"""
+目的: 根据GT视差图生成边缘图并可视化
+  - 输入: GT视差图（.pfm或.png格式）
+  - 输出: 边缘可视化图片，展示GT视差和边缘图的对比
+"""
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -241,7 +246,7 @@ def generate_edge_map(disp_path, output_path='edge_visualization.png', patch_siz
 
 
 if __name__ == '__main__':
-    # 替换为你实际的 GT 视差图路径
+    # 根据 GT 视差，生成 edge 可视化图。
     # test_path = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/disparity/TRAIN/A/0130/left/0015.pfm'
     test_path = '/root/autodl-tmp/stereo/dataset_cache/SceneFlow/FlyingThings3D/disparity/TRAIN/A/0004/left/0012.pfm'
 

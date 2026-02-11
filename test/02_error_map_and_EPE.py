@@ -1,3 +1,10 @@
+"""
+ - 目的: 使用IGEV模型推理视差，计算误差图和EPE统计（整体/边缘区域/平坦区域）
+  - Edge regions mask: 通过GT视差的Sobel梯度计算边缘强度，edge_strength > 2.0 的区域为边缘区域（第299-305行）
+  - Error map: np.abs(pred_disp - gt_disp)，是预测视差和GT视差的绝对误差（第295行）
+  - 不是直接EPE值，EPE是error map在某个区域的平均值（第308-310行）
+"""
+
 import sys
 sys.path.insert(0, '/root/autodl-tmp/stereo')
 
@@ -282,81 +289,113 @@ def load_gt_disparity(gt_path):
     return gt
 
 
-def analyze_error_map(pred_disp, gt_disp, left_img_path, output_path):
-    """分析误差图并计算 EPE"""
-    # 读取原图用于显示
+def compute_edge_from_rgb(img_path):
+    """从RGB图像计算边缘区域"""
+    img = cv2.imread(img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    edge_strength = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    edge_strength = edge_strength / (edge_strength.max() + 1e-8)
+    return edge_strength
+
+
+def analyze_error_map(pred_baseline, pred_our, gt_disp, left_img_path, output_path):
+    """分析两个模型的误差图并计算 EPE"""
     left_img = cv2.imread(left_img_path)
     left_img_rgb = cv2.cvtColor(left_img, cv2.COLOR_BGR2RGB)
 
-    # 掩码处理（排除无效像素）
     mask = (gt_disp > 0) & (gt_disp < 192) & (~np.isinf(gt_disp))
 
-    # 计算 Error Map
-    error_map = np.abs(pred_disp - gt_disp)
-    error_map[~mask] = 0
+    # 两个 Error Map
+    error_baseline = np.abs(pred_baseline - gt_disp)
+    error_baseline[~mask] = 0
+    error_our = np.abs(pred_our - gt_disp)
+    error_our[~mask] = 0
 
-    # 提取边缘区域（基于 GT 视差的梯度）
+    # 边缘区域（从GT视差）
     grad_x = cv2.Sobel(gt_disp, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(gt_disp, cv2.CV_32F, 0, 1, ksize=3)
-    edge_strength = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    edge_strength_gt = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    edge_mask_gt = (edge_strength_gt > 2.0) & mask
 
-    # 设定阈值定义边缘区
-    edge_mask = (edge_strength > 2.0) & mask
-    flat_mask = (edge_strength <= 2.0) & mask
+    # 边缘区域（从RGB图像）
+    edge_strength_rgb = compute_edge_from_rgb(left_img_path)
+    edge_threshold_rgb = np.percentile(edge_strength_rgb, 90)
+    edge_mask_rgb = (edge_strength_rgb > edge_threshold_rgb)
+
+    flat_mask = (edge_strength_gt <= 2.0) & mask
 
     # 统计 EPE
-    epe_total = np.mean(error_map[mask]) if mask.sum() > 0 else 0
-    epe_edge = np.mean(error_map[edge_mask]) if edge_mask.sum() > 0 else 0
-    epe_flat = np.mean(error_map[flat_mask]) if flat_mask.sum() > 0 else 0
+    epe_baseline_total = np.mean(error_baseline[mask]) if mask.sum() > 0 else 0
+    epe_baseline_edge = np.mean(error_baseline[edge_mask_gt]) if edge_mask_gt.sum() > 0 else 0
+    epe_baseline_flat = np.mean(error_baseline[flat_mask]) if flat_mask.sum() > 0 else 0
+    d3_baseline_total = np.mean(error_baseline[mask] > 3) * 100 if mask.sum() > 0 else 0
 
-    print(f"--- EPE 统计结果 ---")
-    print(f"整体 EPE: {epe_total:.4f}")
-    print(f"边缘区域 EPE: {epe_edge:.4f} (关键关注点)")
-    print(f"平坦区域 EPE: {epe_flat:.4f}")
-    if epe_flat > 0:
-        print(f"倍数差异: {epe_edge / epe_flat:.2f}x")
+    epe_our_total = np.mean(error_our[mask]) if mask.sum() > 0 else 0
+    epe_our_edge = np.mean(error_our[edge_mask_gt]) if edge_mask_gt.sum() > 0 else 0
+    epe_our_flat = np.mean(error_our[flat_mask]) if flat_mask.sum() > 0 else 0
+    d3_our_total = np.mean(error_our[mask] > 3) * 100 if mask.sum() > 0 else 0
 
-    # 可视化误差分布
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    print(f"\n--- EPE & D3 统计结果 ---")
+    print(f"Baseline - EPE整体: {epe_baseline_total:.4f}, 边缘: {epe_baseline_edge:.4f}, 平坦: {epe_baseline_flat:.4f}, D3: {d3_baseline_total:.2f}%")
+    print(f"Our      - EPE整体: {epe_our_total:.4f}, 边缘: {epe_our_edge:.4f}, 平坦: {epe_our_flat:.4f}, D3: {d3_our_total:.2f}%")
+
+    # 可视化 (3行3列)
+    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
 
     # 第一行
     axes[0, 0].set_title("Left Image")
     axes[0, 0].imshow(left_img_rgb)
     axes[0, 0].axis('off')
 
-    axes[0, 1].set_title("Ground Truth Disparity")
-    axes[0, 1].imshow(gt_disp, cmap='magma')
+    axes[0, 1].set_title("Edge (RGB)")
+    axes[0, 1].imshow(edge_mask_rgb, cmap='gray')
     axes[0, 1].axis('off')
 
-    axes[0, 2].set_title("Predicted Disparity")
-    axes[0, 2].imshow(pred_disp, cmap='magma')
+    axes[0, 2].set_title("GT Disparity Edge (from GT)")
+    axes[0, 2].imshow(edge_mask_gt, cmap='gray')
     axes[0, 2].axis('off')
 
-    # 第二行
-    axes[1, 0].set_title("Error Map (Bright = High Error)")
-    im = axes[1, 0].imshow(error_map, cmap='hot', vmin=0, vmax=5)
+    # 第二行 - Baseline
+    axes[1, 0].set_title("Predicted Disparity (Baseline)")
+    axes[1, 0].imshow(pred_baseline, cmap='magma')
     axes[1, 0].axis('off')
-    plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
 
-    axes[1, 1].set_title("Edge Regions Mask")
-    axes[1, 1].imshow(edge_mask, cmap='gray')
+    axes[1, 1].set_title("Error Map (Baseline)")
+    im1 = axes[1, 1].imshow(error_baseline, cmap='hot', vmin=0, vmax=5)
     axes[1, 1].axis('off')
+    plt.colorbar(im1, ax=axes[1, 1], fraction=0.046)
 
-    # EPE 统计文字
     axes[1, 2].axis('off')
-    stats_text = f"""EPE Statistics:
-
-Overall EPE: {epe_total:.4f}
-Edge EPE: {epe_edge:.4f}
-Flat EPE: {epe_flat:.4f}
-Edge/Flat Ratio: {epe_edge / epe_flat:.2f}x""" if epe_flat > 0 else f"""EPE Statistics:
-
-Overall EPE: {epe_total:.4f}
-Edge EPE: {epe_edge:.4f}
-Flat EPE: {epe_flat:.4f}"""
-
-    axes[1, 2].text(0.1, 0.5, stats_text, fontsize=14, verticalalignment='center',
+    stats_baseline = f"""Baseline Results:
+EPE Mean:  {epe_baseline_total:.4f}
+EPE Edge:  {epe_baseline_edge:.4f}
+EPE Flat:  {epe_baseline_flat:.4f}
+D3:        {d3_baseline_total:.2f}%"""
+    axes[1, 2].text(0.1, 0.5, stats_baseline, fontsize=12, verticalalignment='center',
                     fontfamily='monospace', transform=axes[1, 2].transAxes)
+
+    # 第三行 - Our
+    axes[2, 0].set_title("Predicted Disparity (Ours)")
+    axes[2, 0].imshow(pred_our, cmap='magma')
+    axes[2, 0].axis('off')
+
+    axes[2, 1].set_title("Error Map (Ours)")
+    im2 = axes[2, 1].imshow(error_our, cmap='hot', vmin=0, vmax=5)
+    axes[2, 1].axis('off')
+    plt.colorbar(im2, ax=axes[2, 1], fraction=0.046)
+
+    axes[2, 2].axis('off')
+    stats_our = f"""Ours Results:
+EPE Mean:  {epe_our_total:.4f}
+EPE Edge:  {epe_our_edge:.4f}
+EPE Flat:  {epe_our_flat:.4f}
+D3:        {d3_our_total:.2f}%"""
+    axes[2, 2].text(0.1, 0.5, stats_our, fontsize=12, verticalalignment='center',
+                    fontfamily='monospace', transform=axes[2, 2].transAxes)
 
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches='tight', dpi=150)
@@ -364,16 +403,18 @@ Flat EPE: {epe_flat:.4f}"""
     plt.close()
 
     print(f"误差分析图已保存至: {output_path}")
-    return epe_total, epe_edge, epe_flat
+    return (epe_baseline_total, epe_baseline_edge, epe_baseline_flat, d3_baseline_total,
+            epe_our_total, epe_our_edge, epe_our_flat, d3_our_total)
 
 
 def main():
     parser = argparse.ArgumentParser(description='IGEV Stereo Error Map and EPE Analysis')
-    parser.add_argument('--model', type=str, default='sceneflow',
-                        choices=['sceneflow', 'finetuned'],
-                        help='Model to use: sceneflow (pretrained) or finetuned')
-    parser.add_argument('--model_path', type=str, default=None,
-                        help='Custom model checkpoint path (overrides --model)')
+    parser.add_argument('--baseline_model', type=str,
+                        default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth',
+                        help='Baseline model checkpoint path')
+    parser.add_argument('--our_model', type=str,
+                        default='../logs/gt_depth_aware/95000_gt_depth_aware_edge_bs6.pth',
+                        help='Our model checkpoint path')
     parser.add_argument('--dataset', type=str, default='middlebury',
                         choices=['kitti2015', 'kitti2012', 'middlebury', 'sceneflow', 'eth3d'],
                         help='Dataset to evaluate')
@@ -399,28 +440,21 @@ def main():
 
     args = parser.parse_args()
 
-    # 自适应设备选择（一次判断）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
 
-    # 确定模型路径
-    if args.model_path:
-        ckpt_path = args.model_path
-        model_name = Path(args.model_path).stem
-    elif args.model == 'sceneflow':
-        ckpt_path = '/root/autodl-tmp/stereo/model_cache/sceneflow.pth'
-        model_name = 'sceneflow'
-    else:  # finetuned
-        # 假设微调模型的默认路径
-        ckpt_path = '/root/autodl-tmp/stereo/model_cache/finetuned.pth'
-        model_name = 'finetuned'
-
-    if not os.path.exists(ckpt_path):
-        print(f"错误: 模型文件不存在: {ckpt_path}")
+    if not os.path.exists(args.baseline_model):
+        print(f"错误: Baseline模型不存在: {args.baseline_model}")
+        return
+    if not os.path.exists(args.our_model):
+        print(f"错误: Our模型不存在: {args.our_model}")
         return
 
-    print(f"加载模型: {ckpt_path}")
-    model = load_model(ckpt_path, device)
+    print(f"加载Baseline模型: {args.baseline_model}")
+    baseline_model = load_model(args.baseline_model, device)
+
+    print(f"加载Our模型: {args.our_model}")
+    our_model = load_model(args.our_model, device)
 
     # 创建输出目录
     output_dir = Path(args.output_dir)
@@ -456,74 +490,70 @@ def main():
     print(f"将处理 {len(samples)} 个样本")
 
     # 处理每个样本
-    all_epe = []
-    epe_results = []  # 存储每个样本的详细结果
+    epe_results = []
     for left_img, right_img, gt_path, sample_id in samples:
         print(f"\n{'='*50}")
         print(f"处理样本: {sample_id}")
-        print(f"左图: {left_img}")
-        print(f"右图: {right_img}")
 
-        # 推理
-        print("正在推理...")
-        pred_disp = inference(model, left_img, right_img, device, args.iters)
+        print("正在推理Baseline模型...")
+        pred_baseline = inference(baseline_model, left_img, right_img, device, args.iters)
 
-        # 加载 GT
+        print("正在推理Our模型...")
+        pred_our = inference(our_model, left_img, right_img, device, args.iters)
+
         gt_disp = load_gt_disparity(gt_path)
 
         if gt_disp is None:
-            print(f"警告: 样本 {sample_id} 没有 GT 视差图，跳过误差分析")
-            # 仅保存预测结果
-            output_name = f"{args.dataset}_{model_name}_{sample_id}_pred.png"
-            output_path = output_dir / output_name
-            plt.figure(figsize=(10, 5))
-            plt.imshow(pred_disp, cmap='magma')
-            plt.colorbar()
-            plt.title(f'Predicted Disparity - {sample_id}')
-            plt.savefig(output_path, bbox_inches='tight')
-            plt.show()
-            plt.close()
-            print(f"预测视差图已保存至: {output_path}")
+            print(f"警告: 样本 {sample_id} 没有 GT，跳过")
             continue
 
-        # 误差分析
-        output_name = f"{args.dataset}_{model_name}_{sample_id}_error.png"
+        output_name = f"{args.dataset}_{sample_id}_comparison.png"
         output_path = output_dir / output_name
 
-        epe_total, epe_edge, epe_flat = analyze_error_map(
-            pred_disp, gt_disp, left_img, str(output_path)
+        epe_baseline_total, epe_baseline_edge, epe_baseline_flat, d3_baseline, \
+        epe_our_total, epe_our_edge, epe_our_flat, d3_our = analyze_error_map(
+            pred_baseline, pred_our, gt_disp, left_img, str(output_path)
         )
-        all_epe.append(epe_total)
+
         epe_results.append({
             'sample_id': sample_id,
-            'epe_total': epe_total,
-            'epe_edge': epe_edge,
-            'epe_flat': epe_flat
+            'baseline_total': epe_baseline_total,
+            'baseline_edge': epe_baseline_edge,
+            'baseline_flat': epe_baseline_flat,
+            'baseline_d3': d3_baseline,
+            'our_total': epe_our_total,
+            'our_edge': epe_our_edge,
+            'our_flat': epe_our_flat,
+            'our_d3': d3_our
         })
 
     # 汇总统计
     if epe_results:
-        # 提取各类 EPE 列表
-        all_epe_total = [r['epe_total'] for r in epe_results]
-        all_epe_edge = [r['epe_edge'] for r in epe_results]
-        all_epe_flat = [r['epe_flat'] for r in epe_results]
-
-        print(f"\n{'='*70}")
-        print(f"各样本 EPE 详情 ({args.dataset if not args.sample_path else 'custom'}, {model_name}):")
-        print(f"{'Sample ID':<30} {'Total EPE':>12} {'Edge EPE':>12} {'Flat EPE':>12}")
-        print("-" * 70)
+        print(f"\n{'='*130}")
+        print(f"各样本详细对比:")
+        print(f"{'Sample ID':<30} {'B_Mean':>10} {'O_Mean':>10} {'B_Edge':>10} {'O_Edge':>10} {'B_Flat':>10} {'O_Flat':>10} {'B_D3':>10} {'O_D3':>10}")
+        print("-" * 130)
         for r in epe_results:
-            print(f"{r['sample_id']:<30} {r['epe_total']:>12.4f} {r['epe_edge']:>12.4f} {r['epe_flat']:>12.4f}")
+            print(f"{r['sample_id']:<30} {r['baseline_total']:>10.4f} {r['our_total']:>10.4f} "
+                  f"{r['baseline_edge']:>10.4f} {r['our_edge']:>10.4f} "
+                  f"{r['baseline_flat']:>10.4f} {r['our_flat']:>10.4f} "
+                  f"{r['baseline_d3']:>9.2f}% {r['our_d3']:>9.2f}%")
 
-        print(f"\n{'='*70}")
-        print(f"汇总统计 (共 {len(epe_results)} 个样本):")
-        print(f"{'指标':<20} {'Total EPE':>12} {'Edge EPE':>12} {'Flat EPE':>12}")
-        print("-" * 70)
-        print(f"{'平均值 (Mean)':<20} {np.mean(all_epe_total):>12.4f} {np.mean(all_epe_edge):>12.4f} {np.mean(all_epe_flat):>12.4f}")
-        print(f"{'最小值 (Min)':<20} {np.min(all_epe_total):>12.4f} {np.min(all_epe_edge):>12.4f} {np.min(all_epe_flat):>12.4f}")
-        print(f"{'最大值 (Max)':<20} {np.max(all_epe_total):>12.4f} {np.max(all_epe_edge):>12.4f} {np.max(all_epe_flat):>12.4f}")
-        print(f"{'标准差 (Std)':<20} {np.std(all_epe_total):>12.4f} {np.std(all_epe_edge):>12.4f} {np.std(all_epe_flat):>12.4f}")
-        print(f"{'='*70}")
+        avg_baseline_total = np.mean([r['baseline_total'] for r in epe_results])
+        avg_baseline_edge = np.mean([r['baseline_edge'] for r in epe_results])
+        avg_baseline_flat = np.mean([r['baseline_flat'] for r in epe_results])
+        avg_baseline_d3 = np.mean([r['baseline_d3'] for r in epe_results])
+
+        avg_our_total = np.mean([r['our_total'] for r in epe_results])
+        avg_our_edge = np.mean([r['our_edge'] for r in epe_results])
+        avg_our_flat = np.mean([r['our_flat'] for r in epe_results])
+        avg_our_d3 = np.mean([r['our_d3'] for r in epe_results])
+
+        print(f"\n{'='*130}")
+        print(f"平均值汇总 (共 {len(epe_results)} 个样本):")
+        print(f"Baseline - EPE Mean: {avg_baseline_total:.4f}, EPE Edge: {avg_baseline_edge:.4f}, EPE Flat: {avg_baseline_flat:.4f}, D3: {avg_baseline_d3:.2f}%")
+        print(f"Ours     - EPE Mean: {avg_our_total:.4f}, EPE Edge: {avg_our_edge:.4f}, EPE Flat: {avg_our_flat:.4f}, D3: {avg_our_d3:.2f}%")
+        print(f"{'='*130}")
 
 
 if __name__ == '__main__':

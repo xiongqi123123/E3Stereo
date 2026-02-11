@@ -365,7 +365,7 @@ if __name__ == '__main__':
     parser.add_argument('--restore_ckpt', help="restore checkpoint",
                         # default='/root/autodl-tmp/stereo/logs/edge_cpt/64000_edge_cpt.pth'
                         # default='/root/autodl-tmp/stereo/logs/edge_d1_26/188500_igev_edge_pt_2_6.pth'
-                        default='/root/autodl-tmp/stereo/logs/ours3_depth_aware_edge/35000_depth_aware_edge.pth'
+                        default='/root/autodl-tmp/stereo/logs/ours3_depth_aware_edge/65000_depth_aware_edge.pth'
                         # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth'
                         )
 
