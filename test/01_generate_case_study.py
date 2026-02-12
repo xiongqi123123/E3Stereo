@@ -603,12 +603,12 @@ if __name__ == '__main__':
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='auto', choices=['cpu', 'cuda', 'auto'], help='选择设备')
-    parser.add_argument('--ckpt_base', default='../model_cache/sceneflow.pth', help='Baseline路径')
+    parser.add_argument('--ckpt_base', default='../model_cache/IGEV/sceneflow.pth', help='Baseline路径')
 
     # parser.add_argument('--ckpt_our', default='../logs/gt_depth_aware/100000_gt_depth_aware_edge_bs6.pth')
     # parser.add_argument('--ckpt_our', default='../logs/edge_d1_26/188500_igev_edge_pt_2_6.pth')
     # parser.add_argument('--ckpt_our', default='../logs/edge_cpt/64000_edge_cpt.pth')
-    parser.add_argument('--ckpt_our', default='../logs/our3_211/90000_gt_lr0002.pth')
+    parser.add_argument('--ckpt_our', default='../logs/our3_211/125000_gt_lr0002.pth')
 
     parser.add_argument('--dataset_type', default='sceneflow',
                         choices=['sceneflow', 'kitti', 'kitti2012', 'kitti2015', 'middlebury', 'eth3d'],
