@@ -216,6 +216,8 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
     total_valid_pixels = 0
     total_epe_sum = 0
     total_d1_sum = 0
+    total_d3_sum = 0
+    total_d5_sum = 0
 
     # Edge analysis counters
     total_edge_pixels = 0
@@ -225,6 +227,8 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
 
     # Image-wise list
     image_epe_list = []
+    image_epe_edge_list = []
+    image_epe_flat_list = []
 
     elapsed_list = []
 
@@ -269,6 +273,8 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
             # --- Pixel Mean Accumulation ---
             total_epe_sum += masked_epe.sum().item()
             total_d1_sum += (masked_epe > 3.0).float().sum().item()
+            total_d3_sum += (masked_epe > 1.0).float().sum().item()
+            total_d5_sum += (masked_epe > 0.5).float().sum().item()
             total_valid_pixels += mask.sum().item()
 
             # --- Image Mean Accumulation ---
@@ -290,11 +296,25 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
                 total_flat_epe += epe[is_flat].sum().item()
                 total_flat_pixels += is_flat.sum().item()
 
+            # --- Image-level Edge/Flat EPE ---
+            for b in range(image1.shape[0]):
+                b_edge = is_edge[b]
+                if b_edge.sum() > 0:
+                    image_epe_edge_list.append(epe[b][b_edge].mean().item())
+
+                b_flat = is_flat[b]
+                if b_flat.sum() > 0:
+                    image_epe_flat_list.append(epe[b][b_flat].mean().item())
+
     # --- Final Aggregation ---
     pixel_epe = total_epe_sum / (total_valid_pixels + 1e-8)
     pixel_d1 = 100 * total_d1_sum / (total_valid_pixels + 1e-8)
+    pixel_d3 = 100 * total_d3_sum / (total_valid_pixels + 1e-8)
+    pixel_d5 = 100 * total_d5_sum / (total_valid_pixels + 1e-8)
 
     image_mean_epe = np.mean(image_epe_list) if len(image_epe_list) > 0 else 0
+    image_mean_epe_edge = np.mean(image_epe_edge_list) if len(image_epe_edge_list) > 0 else 0
+    image_mean_epe_flat = np.mean(image_epe_flat_list) if len(image_epe_flat_list) > 0 else 0
 
     avg_epe_edge = total_edge_epe / (total_edge_pixels + 1e-8)
     avg_epe_flat = total_flat_epe / (total_flat_pixels + 1e-8)
@@ -306,15 +326,16 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
     print(f"\n{'=' * 60}")
     print(f"SceneFlow Validation Results ({len(image_epe_list)} images evaluated)")
     print(f"{'=' * 60}")
-    print(f"  Pixel EPE (All):  {pixel_epe:.4f} (Standard Metric)")
-    print(f"  Image EPE (Mean): {image_mean_epe:.4f}")
+    print(f"  Pixel-level EPE:")
+    print(f"    All:   {pixel_epe:.4f} | Edge: {avg_epe_edge:.4f} | Flat: {avg_epe_flat:.4f}")
+    print(f"  Image-level EPE:")
+    print(f"    All:   {image_mean_epe:.4f} | Edge: {image_mean_epe_edge:.4f} | Flat: {image_mean_epe_flat:.4f}")
     print(f"  -------------------------------------------")
-    print(f"  EPE (Edge):       {avg_epe_edge:.4f}")
-    print(f"  EPE (Flat):       {avg_epe_flat:.4f}")
-    ratio = avg_epe_edge / avg_epe_flat if avg_epe_flat > 0 else 0
-    print(f"  Edge/Flat Ratio:  {ratio:.2f}x")
+    print(f"  D-Metrics (Error Rate):")
+    print(f"    D1 (>3px): {pixel_d1:.2f}%")
+    print(f"    D3 (>1px): {pixel_d3:.2f}%")
+    print(f"    D5 (>0.5px): {pixel_d5:.2f}%")
     print(f"  -------------------------------------------")
-    print(f"  D1 (>3px):        {pixel_d1:.2f}%")
     print(f"  Inference Speed:  {fps:.2f} FPS (Batch Size {batch_size})")
     print(f"{'=' * 60}\n")
 
@@ -323,7 +344,11 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
         'scene-disp-image-epe': image_mean_epe,
         'scene-disp-epe-edge': avg_epe_edge,
         'scene-disp-epe-flat': avg_epe_flat,
-        'scene-disp-d1': pixel_d1
+        'scene-disp-image-epe-edge': image_mean_epe_edge,
+        'scene-disp-image-epe-flat': image_mean_epe_flat,
+        'scene-disp-d1': pixel_d1,
+        'scene-disp-d3': pixel_d3,
+        'scene-disp-d5': pixel_d5
     }
 
 

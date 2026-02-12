@@ -317,15 +317,52 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, rgb_edge_map,
         epe_edge = epe[is_edge] if is_edge.sum() > 0 else epe_all
         epe_flat = epe[is_flat] if is_flat.sum() > 0 else epe_all
 
+        # Pixel-level metrics
         d1 = (epe_all > 3).float().mean().item()
+        d3 = (epe_all > 1).float().mean().item()
+        d5 = (epe_all > 0.5).float().mean().item()
+
+        # Image-level EPE (mean EPE per image)
+        batch_size = final_pred.shape[0]
+        image_epe_list = []
+        image_epe_edge_list = []
+        image_epe_flat_list = []
+
+        for b in range(batch_size):
+            b_valid = valid_mask[b]
+            if b_valid.sum() > 0:
+                image_epe_list.append(epe[b][b_valid].mean().item())
+
+                b_edge = is_edge[b]
+                if b_edge.sum() > 0:
+                    image_epe_edge_list.append(epe[b][b_edge].mean().item())
+
+                b_flat = is_flat[b]
+                if b_flat.sum() > 0:
+                    image_epe_flat_list.append(epe[b][b_flat].mean().item())
+
+        import numpy as np
+        image_epe = np.mean(image_epe_list) if image_epe_list else 0.0
+        image_epe_edge = np.mean(image_epe_edge_list) if image_epe_edge_list else 0.0
+        image_epe_flat = np.mean(image_epe_flat_list) if image_epe_flat_list else 0.0
+
         metrics = {
+            # Pixel-level EPE
             'epe': epe_all.mean().item(),
             'epe_edge': epe_edge.mean().item(),
             'epe_flat': epe_flat.mean().item(),
+            # Image-level EPE
+            'image_epe': image_epe,
+            'image_epe_edge': image_epe_edge,
+            'image_epe_flat': image_epe_flat,
+            # Accuracy metrics
             '1px': (epe_all < 1).float().mean().item(),
             '3px': (epe_all < 3).float().mean().item(),
             '5px': (epe_all < 5).float().mean().item(),
+            # D-metrics (error rate)
             'd1': d1,
+            'd3': d3,
+            'd5': d5,
         }
         return disp_loss, metrics
     else:
@@ -340,17 +377,20 @@ def fetch_optimizer(args, model):
         scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=args.num_steps)
         logging.info("Using ConstantLR")
     else:
+        # 获取warmup比例参数，默认0.05 (5%)
+        pct_start = getattr(args, 'warmup_pct', 0.05)
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             args.lr,
             args.num_steps + 100,
-            pct_start=0.05,
+            pct_start=pct_start,
             div_factor=10.0,
             final_div_factor=20.0,
             cycle_momentum=False,
             anneal_strategy='linear'
         )
-        logging.info(f"Using OneCycleLR: max_lr={args.lr}, pct_start=0.05")
+        warmup_steps = int(args.num_steps * pct_start)
+        logging.info(f"Using OneCycleLR: max_lr={args.lr}, pct_start={pct_start} ({warmup_steps} steps warmup)")
     return optimizer, scheduler
 
 
@@ -374,12 +414,10 @@ class Logger:
         scale_str = f" | EdgeScale: {edge_scale:.2f}" if edge_scale else ""
         print(f"[Ours_3 GT-Edge] Step: {self.total_steps + 1:>6d} | LR: {lr:.2e}{scale_str}")
         print("-" * 80)
-        print(f"  EPE: {avg_metrics.get('epe', 0):.4f} | "
-              f"Edge EPE: {avg_metrics.get('epe_edge', 0):.4f} | "
-              f"Flat EPE: {avg_metrics.get('epe_flat', 0):.4f}")
-        print(f"  1px: {avg_metrics.get('1px', 0) * 100:.2f}% | "
-              f"3px: {avg_metrics.get('3px', 0) * 100:.2f}% | "
-              f"5px: {avg_metrics.get('5px', 0) * 100:.2f}%")
+        print(f"  Pixel EPE - All: {avg_metrics.get('epe', 0):.4f} | Edge: {avg_metrics.get('epe_edge', 0):.4f} | Flat: {avg_metrics.get('epe_flat', 0):.4f}")
+        print(f"  Image EPE - All: {avg_metrics.get('image_epe', 0):.4f} | Edge: {avg_metrics.get('image_epe_edge', 0):.4f} | Flat: {avg_metrics.get('image_epe_flat', 0):.4f}")
+        print(f"  Accuracy - 1px: {avg_metrics.get('1px', 0) * 100:.2f}% | 3px: {avg_metrics.get('3px', 0) * 100:.2f}% | 5px: {avg_metrics.get('5px', 0) * 100:.2f}%")
+        print(f"  D-Metric - D1: {avg_metrics.get('d1', 0) * 100:.2f}% | D3: {avg_metrics.get('d3', 0) * 100:.2f}% | D5: {avg_metrics.get('d5', 0) * 100:.2f}%")
         print("=" * 80)
 
         if self.writer is None:
@@ -593,6 +631,7 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='gt_depth_aware_edge', help="name your experiment")
     parser.add_argument('--restore_ckpt', default=None, help="load the weights from a specific checkpoint")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
+    parser.add_argument('--warmup_pct', type=float, default=0.05, help="warmup percentage for OneCycleLR (0.05 = 5%)")
     parser.add_argument('--da_weight_mode', type=str, default='schedule', choices=['fixed', 'schedule'])
     parser.add_argument('--use_constant_lr', action='store_true')
     parser.add_argument('--num_steps', type=int, default=300000, help="length of training schedule.")
@@ -607,7 +646,7 @@ if __name__ == '__main__':
     parser.add_argument('--mixed_precision', default=True, action='store_false', help='use mixed precision')
     parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'bfloat16', 'float32'],
                         help='Choose precision type: float16 or bfloat16 or float32')
-    parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/gt_depth_aware',
+    parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/our3_211',
                         help='the directory to save logs and checkpoints')
 
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
