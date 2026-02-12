@@ -312,15 +312,6 @@ def fetch_dataloader(args):
             eth3d_root = getattr(args, 'eth3d_root', './dataset_cache/ETH3D')
             new_dataset = ETH3D(aug_params, root=eth3d_root)
             logging.info(f"Adding {len(new_dataset)} samples from ETH3D")
-        elif dataset_name == 'sintel_stereo':
-            new_dataset = SintelStereo(aug_params)*140
-            logging.info(f"Adding {len(new_dataset)} samples from Sintel Stereo")
-        elif dataset_name == 'falling_things':
-            new_dataset = FallingThings(aug_params)*5
-            logging.info(f"Adding {len(new_dataset)} samples from FallingThings")
-        elif dataset_name.startswith('tartan_air'):
-            new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
-            logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 

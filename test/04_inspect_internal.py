@@ -152,9 +152,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # 模型选择 - 可以切换不同的checkpoint
-    parser.add_argument('--ckpt', default='../logs/baseline_igev/1001_igev-stereo.pth')
-    # parser.add_argument('--ckpt', default='../logs/ours_edge_weight/1001_igev-stereo.pth')  # Our方法
-    # parser.add_argument('--ckpt', default='../model_cache/sceneflow.pth')  # 预训练模型
+    parser.add_argument('--ckpt',
+                        default='../model_cache/sceneflow.pth'
+                        # default='../logs/our3_211/90000_gt_lr0002.pth'
+                        )
+
 
     # 测试样本路径 - 提供多个备选样本
     # 样本1: Monkaa - family_x2
@@ -180,6 +182,7 @@ if __name__ == '__main__':
     # 备选样本5: Driving - different scenes
     parser.add_argument('--left_img', default='../dataset_cache/SceneFlow/Driving/frames_finalpass/35mm_focallength/scene_backwards/fast/left/0001.png')
     parser.add_argument('--right_img', default='../dataset_cache/SceneFlow/Driving/frames_finalpass/35mm_focallength/scene_backwards/fast/right/0001.png')
+
     # IGEV Default Params
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128] * 3)
     parser.add_argument('--corr_levels', type=int, default=2)
