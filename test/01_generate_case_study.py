@@ -27,6 +27,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import cv2
+from glob import glob
+import os.path as osp
 from tqdm import tqdm
 from IGEV.igev_stereo import IGEVStereo
 from IGEV.utils import InputPadder
@@ -61,42 +63,86 @@ def extract_edges_disparity(disp, low_thresh=3, high_thresh=10):
     return edges
 
 
-def disp_to_color(disp, max_disp=192):
-    """将视差图转换为彩色热力图"""
+def disp_to_color(disp, valid_mask=None, max_disp=192):
+    """将视差图转换为彩色热力图
+
+    Args:
+        disp: 视差图
+        valid_mask: 可选的有效像素mask，如果提供则只显示有效区域
+        max_disp: 最大视差值，用于归一化
+    """
     if isinstance(disp, torch.Tensor):
         disp_np = disp.detach().cpu().numpy()
     else:
         disp_np = disp
+    if isinstance(valid_mask, torch.Tensor):
+        valid_mask = valid_mask.detach().cpu().numpy()
 
     # 修复：移除多余维度，确保是 (H, W)
     disp_np = np.squeeze(disp_np)
     # 如果 squeeze 后还是 3 维 (例如原本是 1,1,H,W)，则强制取索引
     if disp_np.ndim == 3:
         disp_np = disp_np[0]
+    if valid_mask is not None:
+        valid_mask = np.squeeze(valid_mask)
+        if valid_mask.ndim == 3:
+            valid_mask = valid_mask[0]
 
     disp_np = np.clip(disp_np, 0, max_disp)
     norm_disp = (disp_np / max_disp * 255).astype(np.uint8)
-    return cv2.applyColorMap(norm_disp, cv2.COLORMAP_MAGMA)
+    disp_color = cv2.applyColorMap(norm_disp, cv2.COLORMAP_MAGMA)
+
+    # 如果提供了valid mask，将无效区域设置为黑色
+    if valid_mask is not None:
+        disp_color[~valid_mask] = [0, 0, 0]
+
+    return disp_color
 
 
-def error_to_color(disp_pred, disp_gt, max_err=5.0):
-    """将误差图转换为彩色热力图 (Error Map)"""
+def error_to_color(disp_pred, disp_gt, valid_mask=None, max_err=5.0):
+    """将误差图转换为彩色热力图 (Error Map)
+
+    Args:
+        disp_pred: 预测视差图
+        disp_gt: GT视差图
+        valid_mask: 有效像素mask (True表示有GT标注)
+        max_err: 最大误差值，用于归一化
+    """
     if isinstance(disp_pred, torch.Tensor):
         disp_pred = disp_pred.detach().cpu().numpy()
     if isinstance(disp_gt, torch.Tensor):
         disp_gt = disp_gt.detach().cpu().numpy()
+    if isinstance(valid_mask, torch.Tensor):
+        valid_mask = valid_mask.detach().cpu().numpy()
 
     # 修复：移除多余维度
     disp_pred = np.squeeze(disp_pred)
     disp_gt = np.squeeze(disp_gt)
+    if valid_mask is not None:
+        valid_mask = np.squeeze(valid_mask)
 
     if disp_pred.ndim == 3: disp_pred = disp_pred[0]
     if disp_gt.ndim == 3: disp_gt = disp_gt[0]
+    if valid_mask is not None and valid_mask.ndim == 3: valid_mask = valid_mask[0]
 
+    # 计算误差
     err = np.abs(disp_pred - disp_gt)
-    err_vis = np.clip(err, 0, max_err)
+
+    # 应用valid mask：只在有GT的区域显示误差
+    if valid_mask is not None:
+        err_masked = np.where(valid_mask, err, 0)  # 无效区域设为0
+    else:
+        err_masked = err
+
+    err_vis = np.clip(err_masked, 0, max_err)
     norm_err = (err_vis / max_err * 255).astype(np.uint8)
-    return cv2.applyColorMap(norm_err, cv2.COLORMAP_JET)
+    err_color = cv2.applyColorMap(norm_err, cv2.COLORMAP_JET)
+
+    # 将无效区域设置为黑色
+    if valid_mask is not None:
+        err_color[~valid_mask] = [0, 0, 0]
+
+    return err_color
 
 
 def write_text(img, text):
@@ -149,12 +195,54 @@ def run_comparison(args):
     model_our = load_model(args.ckpt_our, args, device)
 
     # 4. 加载数据
-    print(f"正在加载数据集: {args.dataset_root}")
-    val_dataset = datasets.SceneFlowDatasets(
-        root=args.dataset_root,
-        dstype='frames_finalpass',
-        things_test=True
-    )
+    print(f"正在加载数据集: {args.dataset_type} from {args.dataset_root}")
+
+    if args.dataset_type == 'sceneflow':
+        val_dataset = datasets.SceneFlowDatasets(
+            root=args.dataset_root,
+            dstype='frames_finalpass',
+            things_test=True
+        )
+    elif args.dataset_type == 'kitti':
+        val_dataset = datasets.KITTI(
+            aug_params=None,
+            root=args.dataset_root,
+            image_set='training'
+        )
+    elif args.dataset_type == 'kitti2012':
+        # 只加载KITTI 2012
+        val_dataset = datasets.StereoDataset(aug_params=None, sparse=True, reader=datasets.frame_utils.readDispKITTI)
+        root_12 = osp.join(args.dataset_root, 'KITTI_2012') if 'KITTI_2012' not in args.dataset_root else args.dataset_root
+        image1_list = sorted(glob(os.path.join(root_12, 'training', 'colored_0/*_10.png')))
+        image2_list = sorted(glob(os.path.join(root_12, 'training', 'colored_1/*_10.png')))
+        disp_list = sorted(glob(os.path.join(root_12, 'training', 'disp_occ/*_10.png')))
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            val_dataset.image_list.append([img1, img2])
+            val_dataset.disparity_list.append(disp)
+    elif args.dataset_type == 'kitti2015':
+        # 只加载KITTI 2015
+        val_dataset = datasets.StereoDataset(aug_params=None, sparse=True, reader=datasets.frame_utils.readDispKITTI)
+        root_15 = osp.join(args.dataset_root, 'KITTI_2015') if 'KITTI_2015' not in args.dataset_root else args.dataset_root
+        image1_list = sorted(glob(os.path.join(root_15, 'training', 'image_2/*_10.png')))
+        image2_list = sorted(glob(os.path.join(root_15, 'training', 'image_3/*_10.png')))
+        disp_list = sorted(glob(os.path.join(root_15, 'training', 'disp_occ_0/*_10.png')))
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            val_dataset.image_list.append([img1, img2])
+            val_dataset.disparity_list.append(disp)
+    elif args.dataset_type == 'middlebury':
+        val_dataset = datasets.Middlebury(
+            aug_params=None,
+            root=args.dataset_root,
+            split='H'  # Full resolution
+        )
+    elif args.dataset_type == 'eth3d':
+        val_dataset = datasets.ETH3D(
+            aug_params=None,
+            root=args.dataset_root,
+            split='training'
+        )
+    else:
+        raise ValueError(f"Unsupported dataset type: {args.dataset_type}")
 
     total_len = len(val_dataset)
     if total_len == 0:
@@ -165,6 +253,14 @@ def run_comparison(args):
     indices = np.random.choice(total_len, sample_size, replace=False)
 
     results = []
+
+    # 用于收集所有像素的误差（pixel-level）
+    all_errors_base = []
+    all_errors_our = []
+    all_errors_base_edge = []
+    all_errors_our_edge = []
+    all_errors_base_flat = []
+    all_errors_our_flat = []
 
     print(f"开始评估 {sample_size} 个样本...")
     for idx in tqdm(indices, desc="处理样本"):
@@ -221,12 +317,25 @@ def run_comparison(args):
         d3_our = (diff_our[mask] > 3.0).float().mean().item() * 100 if mask.sum() > 0 else 0.0
         d5_our = (diff_our[mask] > 5.0).float().mean().item() * 100 if mask.sum() > 0 else 0.0
 
+        # Collect pixel-level errors for global statistics
+        if mask.sum() > 0:
+            all_errors_base.append(diff_base[mask].cpu().numpy())
+            all_errors_our.append(diff_our[mask].cpu().numpy())
+        if (mask & edge_mask_tensor).sum() > 0:
+            all_errors_base_edge.append(diff_base[mask & edge_mask_tensor].cpu().numpy())
+            all_errors_our_edge.append(diff_our[mask & edge_mask_tensor].cpu().numpy())
+        if (mask & flat_mask).sum() > 0:
+            all_errors_base_flat.append(diff_base[mask & flat_mask].cpu().numpy())
+            all_errors_our_flat.append(diff_our[mask & flat_mask].cpu().numpy())
+
         # Visualization
         cv2.imwrite(f"{img_dir}/{idx}_left.jpg", cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(f"{img_dir}/{idx}_gt.jpg", disp_to_color(gt))
+        # GT视差图：只显示有效区域（KITTI数据集GT是稀疏的）
+        cv2.imwrite(f"{img_dir}/{idx}_gt.jpg", disp_to_color(gt, valid_mask=mask))
         cv2.imwrite(f"{img_dir}/{idx}_edge_rgb.jpg", edge_rgb)
         cv2.imwrite(f"{img_dir}/{idx}_edge_gt.jpg", edge_gt)
 
+        # Predicted视差图：显示完整预测（不应用mask）
         base_vis = disp_to_color(disp_base)
         base_vis = write_text(base_vis, f"EPE: {epe_base_mean:.2f}")
         cv2.imwrite(f"{img_dir}/{idx}_base.jpg", base_vis)
@@ -235,8 +344,10 @@ def run_comparison(args):
         our_vis = write_text(our_vis, f"EPE: {epe_our_mean:.2f}")
         cv2.imwrite(f"{img_dir}/{idx}_our.jpg", our_vis)
 
-        cv2.imwrite(f"{img_dir}/{idx}_err_base.jpg", error_to_color(disp_base, gt))
-        cv2.imwrite(f"{img_dir}/{idx}_err_our.jpg", error_to_color(disp_our, gt))
+        # 创建valid mask用于error map可视化
+        # mask = (valid_gt > 0.5) & (gt < 192) 已在第256行定义
+        cv2.imwrite(f"{img_dir}/{idx}_err_base.jpg", error_to_color(disp_base, gt, valid_mask=mask))
+        cv2.imwrite(f"{img_dir}/{idx}_err_our.jpg", error_to_color(disp_our, gt, valid_mask=mask))
 
         results.append({
             'id': idx,
@@ -265,8 +376,8 @@ def run_comparison(args):
         else:
             return 'neutral'
 
-    # Compute average metrics
-    avg_metrics = {
+    # Compute image-level average metrics
+    avg_metrics_img = {
         'epe_base_mean': np.mean([r['epe_base_mean'] for r in results]),
         'epe_base_edge': np.mean([r['epe_base_edge'] for r in results]),
         'epe_base_flat': np.mean([r['epe_base_flat'] for r in results]),
@@ -279,6 +390,16 @@ def run_comparison(args):
         'd1_our': np.mean([r['d1_our'] for r in results]),
         'd3_our': np.mean([r['d3_our'] for r in results]),
         'd5_our': np.mean([r['d5_our'] for r in results]),
+    }
+
+    # Compute pixel-level global EPE
+    avg_metrics_px = {
+        'epe_base_overall': np.concatenate(all_errors_base).mean() if len(all_errors_base) > 0 else 0.0,
+        'epe_base_edge': np.concatenate(all_errors_base_edge).mean() if len(all_errors_base_edge) > 0 else 0.0,
+        'epe_base_flat': np.concatenate(all_errors_base_flat).mean() if len(all_errors_base_flat) > 0 else 0.0,
+        'epe_our_overall': np.concatenate(all_errors_our).mean() if len(all_errors_our) > 0 else 0.0,
+        'epe_our_edge': np.concatenate(all_errors_our_edge).mean() if len(all_errors_our_edge) > 0 else 0.0,
+        'epe_our_flat': np.concatenate(all_errors_our_flat).mean() if len(all_errors_our_flat) > 0 else 0.0,
     }
 
     html = f"""
@@ -337,19 +458,29 @@ def run_comparison(args):
         <td><b>MEAN</b></td>
         <td colspan="4">Average across {len(results)} samples</td>
         <td>
-            <table class="metric-table"><tr><td></td><td><b>Base</b></td><td><b>Ours</b></td><td><b>Gain</b></td></tr>
-            <tr><td>EPE Mean</td><td>{avg_metrics['epe_base_mean']:.3f}</td><td>{avg_metrics['epe_our_mean']:.3f}</td>
-                <td class="{compute_gain_class(avg_metrics['epe_base_mean'], avg_metrics['epe_our_mean'])}">{avg_metrics['epe_base_mean'] - avg_metrics['epe_our_mean']:.3f}</td></tr>
-            <tr><td>EPE Edge</td><td>{avg_metrics['epe_base_edge']:.3f}</td><td>{avg_metrics['epe_our_edge']:.3f}</td>
-                <td class="{compute_gain_class(avg_metrics['epe_base_edge'], avg_metrics['epe_our_edge'])}">{avg_metrics['epe_base_edge'] - avg_metrics['epe_our_edge']:.3f}</td></tr>
-            <tr><td>EPE Flat</td><td>{avg_metrics['epe_base_flat']:.3f}</td><td>{avg_metrics['epe_our_flat']:.3f}</td>
-                <td class="{compute_gain_class(avg_metrics['epe_base_flat'], avg_metrics['epe_our_flat'])}">{avg_metrics['epe_base_flat'] - avg_metrics['epe_our_flat']:.3f}</td></tr>
-            <tr><td>D1 (%)</td><td>{avg_metrics['d1_base']:.2f}</td><td>{avg_metrics['d1_our']:.2f}</td>
-                <td class="{compute_gain_class(avg_metrics['d1_base'], avg_metrics['d1_our'])}">{avg_metrics['d1_base'] - avg_metrics['d1_our']:.2f}</td></tr>
-            <tr><td>D3 (%)</td><td>{avg_metrics['d3_base']:.2f}</td><td>{avg_metrics['d3_our']:.2f}</td>
-                <td class="{compute_gain_class(avg_metrics['d3_base'], avg_metrics['d3_our'])}">{avg_metrics['d3_base'] - avg_metrics['d3_our']:.2f}</td></tr>
-            <tr><td>D5 (%)</td><td>{avg_metrics['d5_base']:.2f}</td><td>{avg_metrics['d5_our']:.2f}</td>
-                <td class="{compute_gain_class(avg_metrics['d5_base'], avg_metrics['d5_our'])}">{avg_metrics['d5_base'] - avg_metrics['d5_our']:.2f}</td></tr>
+            <table class="metric-table">
+            <tr><td colspan="4"><b>Image-Level EPE</b></td></tr>
+            <tr><td></td><td><b>Base</b></td><td><b>Ours</b></td><td><b>Gain</b></td></tr>
+            <tr><td>EPE Mean</td><td>{avg_metrics_img['epe_base_mean']:.3f}</td><td>{avg_metrics_img['epe_our_mean']:.3f}</td>
+                <td class="{compute_gain_class(avg_metrics_img['epe_base_mean'], avg_metrics_img['epe_our_mean'])}">{avg_metrics_img['epe_base_mean'] - avg_metrics_img['epe_our_mean']:.3f}</td></tr>
+            <tr><td>EPE Edge</td><td>{avg_metrics_img['epe_base_edge']:.3f}</td><td>{avg_metrics_img['epe_our_edge']:.3f}</td>
+                <td class="{compute_gain_class(avg_metrics_img['epe_base_edge'], avg_metrics_img['epe_our_edge'])}">{avg_metrics_img['epe_base_edge'] - avg_metrics_img['epe_our_edge']:.3f}</td></tr>
+            <tr><td>EPE Flat</td><td>{avg_metrics_img['epe_base_flat']:.3f}</td><td>{avg_metrics_img['epe_our_flat']:.3f}</td>
+                <td class="{compute_gain_class(avg_metrics_img['epe_base_flat'], avg_metrics_img['epe_our_flat'])}">{avg_metrics_img['epe_base_flat'] - avg_metrics_img['epe_our_flat']:.3f}</td></tr>
+            <tr><td colspan="4" style="border-top: 2px solid #666;"><b>Pixel-Level EPE</b></td></tr>
+            <tr><td>EPE Overall</td><td>{avg_metrics_px['epe_base_overall']:.3f}</td><td>{avg_metrics_px['epe_our_overall']:.3f}</td>
+                <td class="{compute_gain_class(avg_metrics_px['epe_base_overall'], avg_metrics_px['epe_our_overall'])}">{avg_metrics_px['epe_base_overall'] - avg_metrics_px['epe_our_overall']:.3f}</td></tr>
+            <tr><td>EPE Edge</td><td>{avg_metrics_px['epe_base_edge']:.3f}</td><td>{avg_metrics_px['epe_our_edge']:.3f}</td>
+                <td class="{compute_gain_class(avg_metrics_px['epe_base_edge'], avg_metrics_px['epe_our_edge'])}">{avg_metrics_px['epe_base_edge'] - avg_metrics_px['epe_our_edge']:.3f}</td></tr>
+            <tr><td>EPE Flat</td><td>{avg_metrics_px['epe_base_flat']:.3f}</td><td>{avg_metrics_px['epe_our_flat']:.3f}</td>
+                <td class="{compute_gain_class(avg_metrics_px['epe_base_flat'], avg_metrics_px['epe_our_flat'])}">{avg_metrics_px['epe_base_flat'] - avg_metrics_px['epe_our_flat']:.3f}</td></tr>
+            <tr><td colspan="4" style="border-top: 2px solid #666;"><b>Other Metrics</b></td></tr>
+            <tr><td>D1 (%)</td><td>{avg_metrics_img['d1_base']:.2f}</td><td>{avg_metrics_img['d1_our']:.2f}</td>
+                <td class="{compute_gain_class(avg_metrics_img['d1_base'], avg_metrics_img['d1_our'])}">{avg_metrics_img['d1_base'] - avg_metrics_img['d1_our']:.2f}</td></tr>
+            <tr><td>D3 (%)</td><td>{avg_metrics_img['d3_base']:.2f}</td><td>{avg_metrics_img['d3_our']:.2f}</td>
+                <td class="{compute_gain_class(avg_metrics_img['d3_base'], avg_metrics_img['d3_our'])}">{avg_metrics_img['d3_base'] - avg_metrics_img['d3_our']:.2f}</td></tr>
+            <tr><td>D5 (%)</td><td>{avg_metrics_img['d5_base']:.2f}</td><td>{avg_metrics_img['d5_our']:.2f}</td>
+                <td class="{compute_gain_class(avg_metrics_img['d5_base'], avg_metrics_img['d5_our'])}">{avg_metrics_img['d5_base'] - avg_metrics_img['d5_our']:.2f}</td></tr>
             </table>
         </td>
     </tr>
@@ -440,16 +571,63 @@ def run_comparison(args):
 
 
 if __name__ == '__main__':
+    """
+     1. SceneFlow（默认）                                                                                                                                                     
+  python test/01_generate_case_study.py \
+      --dataset_type sceneflow \                                                                                                                                           
+      --dataset_root ../dataset_cache/SceneFlow \                                                                                                                          
+      --save_dir web_vis_sceneflow \
+      --num_samples 100
+
+  2. KITTI 2012/2015
+  python test/01_generate_case_study.py \
+      --dataset_type kitti \
+      --dataset_root ../dataset_cache/KITTI \
+      --save_dir web_vis_kitti \
+      --num_samples 50
+
+  3. Middlebury
+  python test/01_generate_case_study.py \
+      --dataset_type middlebury \
+      --dataset_root ../dataset_cache/Middlebury/MiddEval3 \
+      --save_dir web_vis_middlebury \
+      --num_samples 15
+
+  4. ETH3D
+  python test/01_generate_case_study.py \
+      --dataset_type eth3d \
+      --dataset_root ../dataset_cache/ETH3D \
+      --save_dir web_vis_eth3d \
+      --num_samples 27
+
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='auto', choices=['cpu', 'cuda', 'auto'], help='选择设备')
     parser.add_argument('--ckpt_base', default='../model_cache/sceneflow.pth', help='Baseline路径')
-    # parser.add_argument('--ckpt_our', default='../logs/gt_depth_aware/80000_gt_depth_aware_edge_bs6.pth')
-    # parser.add_argument('--ckpt_our', default='../logs/edge_d1_26/188500_igev_edge_pt_2_6.pth')
-    parser.add_argument('--ckpt_our', default='../logs/edge_cpt/64000_edge_cpt.pth')
 
-    parser.add_argument('--save_dir', default='web_vis_cpt')
-    parser.add_argument('--dataset_root', default='../dataset_cache/SceneFlow', help='数据路径')
-    parser.add_argument('--num_samples', type=int, default=100, help='采样数')
+    # parser.add_argument('--ckpt_our', default='../logs/gt_depth_aware/100000_gt_depth_aware_edge_bs6.pth')
+    # parser.add_argument('--ckpt_our', default='../logs/edge_d1_26/188500_igev_edge_pt_2_6.pth')
+    # parser.add_argument('--ckpt_our', default='../logs/edge_cpt/64000_edge_cpt.pth')
+    parser.add_argument('--ckpt_our', default='../logs/our3_211/90000_gt_lr0002.pth')
+
+    parser.add_argument('--dataset_type', default='sceneflow',
+                        choices=['sceneflow', 'kitti', 'kitti2012', 'kitti2015', 'middlebury', 'eth3d'],
+                        help='数据集类型')
+    parser.add_argument('--save_dir',
+                        default='web_vis_sceneflow'
+                        # default='web_vis_kitti2012'
+                        # default='web_vis_kitti2015'
+                        # default='web_vis_middlebury'
+                        # default='web_vis_eth3d'
+                        )
+    parser.add_argument('--dataset_root',
+                        default='../dataset_cache/SceneFlow',
+                        # default='../dataset_cache/KITTI/KITTI_2012',
+                        # default='../dataset_cache/KITTI/KITTI_2015',
+                        # default='../dataset_cache/Middlebury/Middlebury',
+                        # default='../dataset_cache/ETH3D',
+                        help='数据路径')
+    parser.add_argument('--num_samples', type=int, default=50, help='采样数')
 
     # IGEV Args
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128] * 3)
@@ -459,7 +637,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_gru_layers', type=int, default=3)
     parser.add_argument('--max_disp', type=int, default=192)
     parser.add_argument('--mixed_precision', action='store_true', default=True)
-    parser.add_argument('--precision_dtype', default='float16')
+    parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'float32', 'bfloat16'])
 
     args = parser.parse_args()
     run_comparison(args)
