@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from submodule import *
+from IGEV.submodule import *
 import timm
 
 
@@ -203,6 +203,8 @@ class MultiBasicEncoder(nn.Module):
         self.norm_fn = norm_fn
         self.downsample = downsample
 
+        # self.norm_111 = nn.BatchNorm2d(128, affine=False, track_running_stats=False)
+        # self.norm_222 = nn.BatchNorm2d(128, affine=False, track_running_stats=False)
 
         if self.norm_fn == 'group':
             self.norm1 = nn.GroupNorm(num_groups=8, num_channels=64)

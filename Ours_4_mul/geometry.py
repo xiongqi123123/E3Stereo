@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from utils import bilinear_sampler
+from Ours_4_mul.utils import bilinear_sampler
 
 
 class Combined_Geo_Encoding_Volume:

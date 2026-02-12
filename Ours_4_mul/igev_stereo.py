@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from update import BasicMultiUpdateBlock
-from extractor import MultiBasicEncoder, Feature
-from geometry import Combined_Geo_Encoding_Volume
-from submodule import *
+from Ours_4_mul.update import BasicMultiUpdateBlock
+from Ours_4_mul.extractor import MultiBasicEncoder, Feature
+from Ours_4_mul.geometry import Combined_Geo_Encoding_Volume
+from Ours_4_mul.submodule import *
+from Ours_4_mul.edge_cross_attention import EdgeGuidedCrossAttention
 import time
 
 try:
@@ -140,6 +141,10 @@ class IGEVStereo(nn.Module):
         self.cost_agg = hourglass(8)
         self.classifier = nn.Conv3d(8, 1, 3, 1, 1, bias=False)
 
+        # Edge-Guided Cross-Attention: 增强左右图交互 (edge-gated)
+        self.edge_cross_attn = EdgeGuidedCrossAttention(
+            match_dim=96, context_dims=args.hidden_dims, num_heads=4)
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -156,8 +161,25 @@ class IGEVStereo(nn.Module):
 
         return up_disp
 
-    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
-        """ Estimate disparity between pair of frames """
+    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False,
+                prompt_module=None):
+        """ Estimate disparity between pair of frames
+
+        Args:
+            prompt_module: 可选的 prompt 模块 (F1/F2/F3)，用于 few-shot adaptation。
+                支持接口:
+                - prepare(image1_raw): 预处理（如 F3 提取 edge map）
+                - modulate_geo_feat(geo_feat): 调制 geo_feat (F2, F3)
+                - modulate_hidden(net_list): 调制 GRU hidden states (F1)
+        """
+
+        # 通知 prompt module 当前输入图像（F3 需要提取 edge map）
+        image1_raw = image1  # 保留原始 0-255 图像给 prompt module
+        image2_raw = image2  # 保留右图原始图像给 EGCA
+        if prompt_module is not None and hasattr(prompt_module, 'prepare'):
+            prompt_module.prepare(image1_raw)
+        # EGCA: 提取左右边缘图 (frozen Sobel, 无梯度)
+        self.edge_cross_attn.extract_edge(image1_raw, image2_raw)
 
         image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
         image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
@@ -174,6 +196,11 @@ class IGEVStereo(nn.Module):
 
             match_left = self.desc(self.conv(features_left[0]))
             match_right = self.desc(self.conv(features_right[0]))
+
+            # EGCA Stage 1: edge-gated 极线交叉注意力增强 match 特征
+            match_left, match_right = self.edge_cross_attn.enhance_match(
+                match_left, match_right)
+
             gwc_volume = build_gwc_volume(match_left, match_right, self.args.max_disp // 4, 8)
             gwc_volume = self.corr_stem(gwc_volume)
             gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
@@ -182,6 +209,9 @@ class IGEVStereo(nn.Module):
             # Init disp from geometry encoding volume
             prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
             init_disp = disparity_regression(prob, self.args.max_disp // 4)
+
+            # EGCA Stage 3: edge-aware 初始视差修正 (只修 edge, flat 不变)
+            init_disp = self.edge_cross_attn.refine_disp(init_disp)
 
             del prob, gwc_volume
 
@@ -197,6 +227,9 @@ class IGEVStereo(nn.Module):
             inp_list = [list(conv(i).split(split_size=conv.out_channels // 3, dim=1)) for i, conv in
                         zip(inp_list, self.context_zqr_convs)]
 
+            # EGCA Stage 2: 将交叉注意力特征注入 GRU 隐状态 (edge-gated)
+            net_list = self.edge_cross_attn.enhance_context(net_list)
+
         geo_block = Combined_Geo_Encoding_Volume
         geo_fn = geo_block(match_left.float(), match_right.float(), geo_encoding_volume.float(),
                            radius=self.args.corr_radius, num_levels=self.args.corr_levels)
@@ -209,8 +242,18 @@ class IGEVStereo(nn.Module):
         for itr in range(iters):
             disp = disp.detach()
             geo_feat = geo_fn(disp, coords)
+
+            # === Prompt injection: modulate geo_feat (F2, F3) ===
+            if prompt_module is not None and hasattr(prompt_module, 'modulate_geo_feat'):
+                geo_feat = prompt_module.modulate_geo_feat(geo_feat)
+
             with autocast(enabled=self.args.mixed_precision,
                           dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+
+                # === Prompt injection: modulate GRU hidden states (F1) ===
+                if prompt_module is not None and hasattr(prompt_module, 'modulate_hidden'):
+                    net_list = prompt_module.modulate_hidden(net_list)
+
                 net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp,
                                                                       iter16=self.args.n_gru_layers == 3,
                                                                       iter08=self.args.n_gru_layers >= 2)

@@ -12,8 +12,8 @@ from pathlib import Path
 from glob import glob
 import os.path as osp
 
-import frame_utils
-from augmentor import FlowAugmentor, SparseFlowAugmentor
+from IGEV import frame_utils
+from IGEV.augmentor import FlowAugmentor, SparseFlowAugmentor
 
 
 class StereoDataset(data.Dataset):
@@ -296,35 +296,26 @@ def fetch_dataloader(args):
     train_dataset = None
     for dataset_name in args.train_datasets:
         if re.compile("middlebury_.*").fullmatch(dataset_name):
-            middlebury_root = getattr(args, 'middlebury_root', '/root/autodl-tmp/stereo/dataset_cache/Middlebury/MiddEval3')
+            middlebury_root = getattr(args, 'middlebury_root', './dataset_cache/Middlebury/MiddEval3')
             new_dataset = Middlebury(aug_params, root=middlebury_root, split=dataset_name.replace('middlebury_',''))
             logging.info(f"Adding {len(new_dataset)} samples from Middlebury")
         elif dataset_name == 'sceneflow':
-            sceneflow_root = getattr(args, 'sceneflow_root', '/root/autodl-tmp/stereo/dataset_cache/SceneFlow')
+            sceneflow_root = getattr(args, 'sceneflow_root', './dataset_cache/SceneFlow')
             final_dataset = SceneFlowDatasets(aug_params, root=sceneflow_root, dstype='frames_finalpass')
             new_dataset = final_dataset
             logging.info(f"Adding {len(new_dataset)} samples from SceneFlow")
         elif 'kitti' in dataset_name:
-            kitti_root = getattr(args, 'kitti_root', '/root/autodl-tmp/stereo/dataset_cache/KITTI')
+            kitti_root = getattr(args, 'kitti_root', './dataset_cache/KITTI')
             new_dataset = KITTI(aug_params, root=kitti_root)
             logging.info(f"Adding {len(new_dataset)} samples from KITTI")
         elif dataset_name == 'eth3d':
-            eth3d_root = getattr(args, 'eth3d_root', '/root/autodl-tmp/stereo/dataset_cache/ETH3D')
+            eth3d_root = getattr(args, 'eth3d_root', './dataset_cache/ETH3D')
             new_dataset = ETH3D(aug_params, root=eth3d_root)
             logging.info(f"Adding {len(new_dataset)} samples from ETH3D")
-        elif dataset_name == 'sintel_stereo':
-            new_dataset = SintelStereo(aug_params)*140
-            logging.info(f"Adding {len(new_dataset)} samples from Sintel Stereo")
-        elif dataset_name == 'falling_things':
-            new_dataset = FallingThings(aug_params)*5
-            logging.info(f"Adding {len(new_dataset)} samples from FallingThings")
-        elif dataset_name.startswith('tartan_air'):
-            new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
-            logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size,
-        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 8)), drop_last=True, persistent_workers=True, prefetch_factor=2)
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
+        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, drop_last=True)
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
