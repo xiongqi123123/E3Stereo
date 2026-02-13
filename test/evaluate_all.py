@@ -266,7 +266,7 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
         _, image1, image2, flow_gt, valid_gt = data_blob
         image1, image2 = image1.to(device), image2.to(device)
 
-        # Edge在GPU上计算（快），然后转CPU
+        # ===== 在padding之前提取边缘（GPU上计算，快）=====
         edge_map = extract_edge_sobel_batch(image1).cpu()  # [B, H, W]
 
         padder = InputPadder(image1.shape, divis_by=32)
