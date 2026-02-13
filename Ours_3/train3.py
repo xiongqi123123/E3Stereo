@@ -589,7 +589,10 @@ def train(args):
 
             if accumulation_counter >= args.gradient_accumulation_steps:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if args.train_datasets == 'sceneflow':
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
 
                 scaler.step(optimizer)
                 scheduler.step()
@@ -691,7 +694,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_pct', type=float, default=0.05, help="warmup percentage for OneCycleLR (0.05 = 5%)")
     parser.add_argument('--da_weight_mode', type=str, default='fixed', choices=['fixed', 'schedule'])
     parser.add_argument('--use_constant_lr', action='store_true')
-    parser.add_argument('--num_steps', type=int, default=300000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
     parser.add_argument('--batch_size', type=int, default=4, help="batch size used during training.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2,
                         help="number of gradient accumulation steps")
@@ -700,8 +703,8 @@ if __name__ == '__main__':
     parser.add_argument('--train_iters', type=int, default=12,
                         help="number of updates to the disparity field in each forward pass.")
 
-    parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
-    parser.add_argument('--precision_dtype', default='float32', choices=['float16', 'bfloat16', 'float32'],
+    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+    parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'bfloat16', 'float32'],
                         help='Choose precision type: float16 or bfloat16 or float32')
     parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/our3_211',
                         help='the directory to save logs and checkpoints')
