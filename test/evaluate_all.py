@@ -208,7 +208,7 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
     2. Quantile(0.98)边缘检测（参照IGEV标准）
     3. Image-level和Pixel-level双指标
     4. Overall/Edge/Flat三类区域EPE
-    5. D1/D3/D5错误率（>3px, >1px, >0.5px）
+    5. D1/D3/D5错误率（>3px, >1px, >2.0px）
     """
     if root is None: root = DEFAULT_SCENEFLOW_ROOT
     if device is None: device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -308,12 +308,12 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
             pix_all_cnt += b_mask.sum().item()
             pix_all_d1 += (all_epe_vals > 3.0).sum().item()
             pix_all_d3 += (all_epe_vals > 1.0).sum().item()
-            pix_all_d5 += (all_epe_vals > 0.5).sum().item()
+            pix_all_d5 += (all_epe_vals > 2.0).sum().item()
 
             img_all_epe.append(all_epe_vals.mean().item())
             img_all_d1.append((all_epe_vals > 3.0).float().mean().item())
             img_all_d3.append((all_epe_vals > 1.0).float().mean().item())
-            img_all_d5.append((all_epe_vals > 0.5).float().mean().item())
+            img_all_d5.append((all_epe_vals > 2.0).float().mean().item())
 
             # Edge区域
             b_edge_mask = (b_edge_map > edge_threshold) & b_mask
@@ -323,12 +323,12 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
                 pix_edge_cnt += b_edge_mask.sum().item()
                 pix_edge_d1 += (edge_epe_vals > 3.0).sum().item()
                 pix_edge_d3 += (edge_epe_vals > 1.0).sum().item()
-                pix_edge_d5 += (edge_epe_vals > 0.5).sum().item()
+                pix_edge_d5 += (edge_epe_vals > 2.0).sum().item()
 
                 img_edge_epe.append(edge_epe_vals.mean().item())
                 img_edge_d1.append((edge_epe_vals > 3.0).float().mean().item())
                 img_edge_d3.append((edge_epe_vals > 1.0).float().mean().item())
-                img_edge_d5.append((edge_epe_vals > 0.5).float().mean().item())
+                img_edge_d5.append((edge_epe_vals > 2.0).float().mean().item())
 
             # Flat区域
             b_flat_mask = (b_edge_map <= edge_threshold) & b_mask
@@ -338,12 +338,12 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
                 pix_flat_cnt += b_flat_mask.sum().item()
                 pix_flat_d1 += (flat_epe_vals > 3.0).sum().item()
                 pix_flat_d3 += (flat_epe_vals > 1.0).sum().item()
-                pix_flat_d5 += (flat_epe_vals > 0.5).sum().item()
+                pix_flat_d5 += (flat_epe_vals > 2.0).sum().item()
 
                 img_flat_epe.append(flat_epe_vals.mean().item())
                 img_flat_d1.append((flat_epe_vals > 3.0).float().mean().item())
                 img_flat_d3.append((flat_epe_vals > 1.0).float().mean().item())
-                img_flat_d5.append((flat_epe_vals > 0.5).float().mean().item())
+                img_flat_d5.append((flat_epe_vals > 2.0).float().mean().item())
 
         # 更新进度条
         if len(img_all_epe) > 0:
@@ -396,14 +396,14 @@ def validate_sceneflow(model, iters=32, mixed_prec=True, device=None, root=None,
     print(f"{'Image-level EPE':<25} {img_epe_all:>12.4f} {img_epe_edge:>12.4f} {img_epe_flat:>12.4f}")
     print(f"{'Pixel-level EPE':<25} {pix_epe_all:>12.4f} {pix_epe_edge:>12.4f} {pix_epe_flat:>12.4f}")
     print(f"{'-'*80}")
-    print(f"{'Image-level D1 (>3px)':<25} {img_d1_all:>11.2f}% {img_d1_edge:>11.2f}% {img_d1_flat:>11.2f}%")
-    print(f"{'Pixel-level D1 (>3px)':<25} {pix_d1_all:>11.2f}% {pix_d1_edge:>11.2f}% {pix_d1_flat:>11.2f}%")
+    print(f"{'Image-level D3 (>3px)':<25} {img_d1_all:>11.2f}% {img_d1_edge:>11.2f}% {img_d1_flat:>11.2f}%")
+    print(f"{'Pixel-level D3 (>3px)':<25} {pix_d1_all:>11.2f}% {pix_d1_edge:>11.2f}% {pix_d1_flat:>11.2f}%")
     print(f"{'-'*80}")
-    print(f"{'Image-level D3 (>1px)':<25} {img_d3_all:>11.2f}% {img_d3_edge:>11.2f}% {img_d3_flat:>11.2f}%")
-    print(f"{'Pixel-level D3 (>1px)':<25} {pix_d3_all:>11.2f}% {pix_d3_edge:>11.2f}% {pix_d3_flat:>11.2f}%")
+    print(f"{'Image-level D1 (>1px)':<25} {img_d3_all:>11.2f}% {img_d3_edge:>11.2f}% {img_d3_flat:>11.2f}%")
+    print(f"{'Pixel-level D1 (>1px)':<25} {pix_d3_all:>11.2f}% {pix_d3_edge:>11.2f}% {pix_d3_flat:>11.2f}%")
     print(f"{'-'*80}")
-    print(f"{'Image-level D5 (>0.5px)':<25} {img_d5_all:>11.2f}% {img_d5_edge:>11.2f}% {img_d5_flat:>11.2f}%")
-    print(f"{'Pixel-level D5 (>0.5px)':<25} {pix_d5_all:>11.2f}% {pix_d5_edge:>11.2f}% {pix_d5_flat:>11.2f}%")
+    print(f"{'Image-level D2 (>2.0px)':<25} {img_d5_all:>11.2f}% {img_d5_edge:>11.2f}% {img_d5_flat:>11.2f}%")
+    print(f"{'Pixel-level D2 (>2.0px)':<25} {pix_d5_all:>11.2f}% {pix_d5_edge:>11.2f}% {pix_d5_flat:>11.2f}%")
     print(f"{'='*80}")
     print(f"Total pixels: {pix_all_cnt:,} | Edge: {pix_edge_cnt:,} | Flat: {pix_flat_cnt:,}")
     print(f"FPS: {fps:.2f} (Batch size: {batch_size})")
@@ -488,10 +488,13 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False, device=Non
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint",
-                        default="../model_cache/IGEV/sceneflow.pth"
+                        # default="../model_cache/IGEV/sceneflow.pth"
                         # default='../logs/our3_211/195000_gt_lr0002.pth'
+                        # default = '../logs/edge_d1_26/188500_igev_edge_pt_2_6.pth'
+                        default = '../logs/edge_cpt/64000_edge_cpt.pth'
                         )
-    parser.add_argument('--dataset', help="dataset for evaluation", default='sceneflow',
+    parser.add_argument('--dataset', help="dataset for evaluation",
+                        default='sceneflow',
                         choices=["eth3d", "kitti", "sceneflow"] + [f"middlebury_{s}" for s in 'FHQ'])
     parser.add_argument('--mixed_precision', default=True, action='store_false', help='use mixed precision')
     parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'bfloat16', 'float32'],

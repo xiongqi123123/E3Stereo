@@ -8,3 +8,4 @@
 .idea/
 *.xml
 /test/output/
+/test/inspection_output/

@@ -365,8 +365,8 @@ if __name__ == '__main__':
     parser.add_argument('--restore_ckpt', help="restore checkpoint",
                         # default='/root/autodl-tmp/stereo/logs/edge_cpt/64000_edge_cpt.pth'
                         # default='/root/autodl-tmp/stereo/logs/edge_d1_26/188500_igev_edge_pt_2_6.pth'
-                        default='/root/autodl-tmp/stereo/logs/ours3_depth_aware_edge/65000_depth_aware_edge.pth'
-                        # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth'
+                        # default='../logs/our3_211/195000_gt_lr0002.pth'
+                        default='/root/autodl-tmp/stereo/model_cache/IGEV/sceneflow.pth'
                         )
 
     parser.add_argument('--dataset', help="dataset for evaluation", default='sceneflow',
@@ -375,7 +375,7 @@ if __name__ == '__main__':
     parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'bfloat16', 'float32'])
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
     parser.add_argument('--val_samples', type=int, default=0, help='number of samples to validate (0 for all)')
-    parser.add_argument('--batch_size', type=int, default=2, help='batch size for evaluation')
+    parser.add_argument('--batch_size', type=int, default=4, help='batch size for evaluation')
     parser.add_argument('--no_compile', action='store_true', help='disable torch.compile')
 
     parser.add_argument('--dataset_root', type=str, default=DEFAULT_DATASET_ROOT)

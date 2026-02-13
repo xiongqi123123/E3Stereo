@@ -608,7 +608,7 @@ if __name__ == '__main__':
     # parser.add_argument('--ckpt_our', default='../logs/gt_depth_aware/100000_gt_depth_aware_edge_bs6.pth')
     # parser.add_argument('--ckpt_our', default='../logs/edge_d1_26/188500_igev_edge_pt_2_6.pth')
     # parser.add_argument('--ckpt_our', default='../logs/edge_cpt/64000_edge_cpt.pth')
-    parser.add_argument('--ckpt_our', default='../logs/our3_211/125000_gt_lr0002.pth')
+    parser.add_argument('--ckpt_our', default='../logs/our3_211/195000_gt_lr0002.pth')
 
     parser.add_argument('--dataset_type', default='sceneflow',
                         choices=['sceneflow', 'kitti', 'kitti2012', 'kitti2015', 'middlebury', 'eth3d'],
@@ -627,7 +627,7 @@ if __name__ == '__main__':
                         # default='../dataset_cache/Middlebury/Middlebury',
                         # default='../dataset_cache/ETH3D',
                         help='数据路径')
-    parser.add_argument('--num_samples', type=int, default=50, help='采样数')
+    parser.add_argument('--num_samples', type=int, default=100, help='采样数')
 
     # IGEV Args
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128] * 3)

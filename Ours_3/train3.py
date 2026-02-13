@@ -240,9 +240,6 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, rgb_edge_map,
     【重要修改】现在使用 GT 视差来计算边缘权重，而非使用预测视差。
     """
     n_predictions = len(disp_preds)
-    mag = torch.sum(disp_gt ** 2, dim=1).sqrt()
-    # 有效性 Mask：GT 存在且在最大视差范围内
-    valid_mask = (valid >= 0.5) & (mag < max_disp)
 
     def _get_pixel_weights(edge_map):
         pw = compute_adaptive_weight(edge_map, base_weight=1.0, edge_scale=edge_scale)
@@ -256,7 +253,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, rgb_edge_map,
     final_edge_map = rgb_edge_map  # 默认只是 RGB
 
     if depth_aware:
-        # 1. 提取 GT 边缘
+        # 1. 提取 GT 边缘 (disp_gt is [B, 1, H, W] at this point)
         disp_gt_edge = extract_disp_edge(disp_gt)
         # 2. 融合 RGB 和 GT 边缘 (使用当前步数的权重)
         # 注意：这里计算出的 joint_edge 对本次 batch 的所有 iterations 都是通用的
@@ -267,6 +264,13 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, rgb_edge_map,
 
     # 预计算权重 (所有 iteration 共享同一个客观的权重图)
     target_weights = _get_pixel_weights(final_edge_map)
+
+    # Squeeze channel dimension for valid mask computation: [B, 1, H, W] -> [B, H, W]
+    disp_gt_2d = disp_gt.squeeze(1)
+    valid_2d = valid.squeeze(1)
+    mag = disp_gt_2d.abs()  # For single-channel disparity
+    # 有效性 Mask：GT 存在且在最大视差范围内
+    valid_mask = (valid_2d >= 0.5) & (mag < max_disp)
 
     # 辅助函数：计算加权 Loss
     def weighted_l1(pred, gt, weights, mask):
@@ -414,10 +418,14 @@ class Logger:
         scale_str = f" | EdgeScale: {edge_scale:.2f}" if edge_scale else ""
         print(f"[Ours_3 GT-Edge] Step: {self.total_steps + 1:>6d} | LR: {lr:.2e}{scale_str}")
         print("-" * 80)
-        print(f"  Pixel EPE - All: {avg_metrics.get('epe', 0):.4f} | Edge: {avg_metrics.get('epe_edge', 0):.4f} | Flat: {avg_metrics.get('epe_flat', 0):.4f}")
-        print(f"  Image EPE - All: {avg_metrics.get('image_epe', 0):.4f} | Edge: {avg_metrics.get('image_epe_edge', 0):.4f} | Flat: {avg_metrics.get('image_epe_flat', 0):.4f}")
-        print(f"  Accuracy - 1px: {avg_metrics.get('1px', 0) * 100:.2f}% | 3px: {avg_metrics.get('3px', 0) * 100:.2f}% | 5px: {avg_metrics.get('5px', 0) * 100:.2f}%")
-        print(f"  D-Metric - D1: {avg_metrics.get('d1', 0) * 100:.2f}% | D3: {avg_metrics.get('d3', 0) * 100:.2f}% | D5: {avg_metrics.get('d5', 0) * 100:.2f}%")
+        print(
+            f"  Pixel EPE - All: {avg_metrics.get('epe', 0):.4f} | Edge: {avg_metrics.get('epe_edge', 0):.4f} | Flat: {avg_metrics.get('epe_flat', 0):.4f}")
+        print(
+            f"  Image EPE - All: {avg_metrics.get('image_epe', 0):.4f} | Edge: {avg_metrics.get('image_epe_edge', 0):.4f} | Flat: {avg_metrics.get('image_epe_flat', 0):.4f}")
+        print(
+            f"  Accuracy - 1px: {avg_metrics.get('1px', 0) * 100:.2f}% | 3px: {avg_metrics.get('3px', 0) * 100:.2f}% | 5px: {avg_metrics.get('5px', 0) * 100:.2f}%")
+        print(
+            f"  D-Metric - D1: {avg_metrics.get('d1', 0) * 100:.2f}% | D3: {avg_metrics.get('d3', 0) * 100:.2f}% | D5: {avg_metrics.get('d5', 0) * 100:.2f}%")
         print("=" * 80)
 
         if self.writer is None:
@@ -461,14 +469,22 @@ class Logger:
         train_epe = self.last_train_metrics.get('epe', 0)
         train_d1 = self.last_train_metrics.get('d1', 0) * 100
 
-        val_epe = val_results.get('scene-disp-epe', val_results.get('kitti-epe', 0))
-        val_d1 = val_results.get('scene-disp-d1', val_results.get('kitti-d1', 0))
+        # Handle different validation datasets with new key naming
+        val_epe = (val_results.get('sceneflow-pix-epe-all') or
+                   val_results.get('eth3d-pix-epe-all-all') or
+                   val_results.get('middleburyH-pix-epe-all-all') or
+                   val_results.get('kitti-epe') or 0)
+
+        val_d1 = (val_results.get('sceneflow-pix-d1') or
+                  val_results.get('eth3d-pix-bad1-all') or
+                  val_results.get('middleburyH-pix-bad2-all') or
+                  val_results.get('kitti-d1') or 0)
 
         print(f"{'Metric':<15} {'Train':>12} {'Val':>12}")
         print("-" * 40)
         print(f"{'Loss':<15} {train_loss:>12.4f} {'N/A':>12}")
         print(f"{'EPE':<15} {train_epe:>12.4f} {val_epe:>12.4f}")
-        print(f"{'D1 (>3px)':<15} {train_d1:>11.2f}% {val_d1:>11.2f}%")
+        print(f"{'Error Rate':<15} {train_d1:>11.2f}% {val_d1:>11.2f}%")
         print("=" * 80 + "\n")
 
     def close(self):
@@ -525,11 +541,15 @@ def train(args):
     pbar = tqdm(total=args.num_steps, desc="Training", dynamic_ncols=True)
 
     while total_steps < args.num_steps:
-        for i_batch, (_, *data_blob) in enumerate(train_loader):
+        # 直接获取 batch_data，不要用 (_, *...)
+        for i_batch, batch_data in enumerate(train_loader):
             if total_steps >= args.num_steps:
                 break
 
-            image1, image2, disp_gt, valid = [x.to(args.device) for x in data_blob]
+            # Unpack: first element is file paths (tuple), rest are tensors
+            file_paths, image1, image2, disp_gt, valid = batch_data
+            # Move only tensors to GPU
+            image1, image2, disp_gt, valid = image1.to(args.device), image2.to(args.device), disp_gt.to(args.device), valid.to(args.device)
 
             # RGB Edge
             edge_map = extract_edge_from_image(image1)
@@ -594,26 +614,63 @@ def train(args):
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
-                if 'sceneflow' in args.train_datasets:
-                    results = validate_sceneflow(model.module, iters=args.valid_iters, root=args.sceneflow_root,
-                                                 val_samples=args.val_samples)
-                elif 'kitti' in args.train_datasets:
-                    results = validate_kitti(model.module, iters=args.valid_iters, root=args.kitti_root,
+                # ================= [FIX START] 多数据集验证逻辑 =================
+                results = {}
+
+                # 遍历用户指定的所有验证集
+                for val_set in args.eval_datasets:
+                    logging.info(f"Validating on {val_set}...")
+
+                    if val_set == 'eth3d':
+                        # 确保 eth3d_root 已传入
+                        res = validate_eth3d(model.module, iters=args.valid_iters, root=args.eth3d_root,
                                              val_samples=args.val_samples)
-                else:
-                    raise Exception('Unknown validation dataset.')
+                    elif val_set == 'middlebury':
+                        # 默认验证 Half 分辨率 (H)，速度较快且能反映泛化性
+                        res = validate_middlebury(model.module, iters=args.valid_iters, root=args.middlebury_root,
+                                                  split='H', val_samples=args.val_samples)
+                    elif val_set == 'kitti':
+                        res = validate_kitti(model.module, iters=args.valid_iters, root=args.kitti_root,
+                                             val_samples=args.val_samples)
+                    elif val_set == 'sceneflow':
+                        res = validate_sceneflow(model.module, iters=args.valid_iters, root=args.sceneflow_root,
+                                                 val_samples=args.val_samples)
+
+                    # 合并结果字典
+                    results.update(res)
+
+                # 记录日志
                 logger.write_dict(results)
                 logger.print_train_val_comparison(results)
 
-                current_epe = results.get('scene-disp-epe', results.get('kitti-epe', float('inf')))
-                if current_epe < best_epe:
-                    best_epe = current_epe
-                    best_ckpt_path = ckpt_output_dir / f'{args.name}_best_epe{current_epe:.4f}_step{total_steps}.pth'
+                # ================= 最佳模型保存逻辑 =================
+                # 优先级策略：ETH3D Bad1.0 > Middlebury Bad2.0 > KITTI D1 > SceneFlow EPE
+                target_metric = float('inf')
+                metric_name = "metric"
+
+                if 'eth3d-pix-bad1-all' in results:
+                    target_metric = results['eth3d-pix-bad1-all']
+                    metric_name = "eth3d_bad1"
+                elif 'middleburyH-pix-bad2-all' in results:
+                    target_metric = results['middleburyH-pix-bad2-all']
+                    metric_name = "midd_bad2"
+                elif 'kitti-d1' in results:
+                    target_metric = results['kitti-d1']
+                    metric_name = "kitti_d1"
+                elif 'sceneflow-pix-epe-all' in results:
+                    target_metric = results['sceneflow-pix-epe-all']
+                    metric_name = "sf_epe"
+
+                if target_metric < best_epe:
+                    best_epe = target_metric
+                    # 文件名体现是哪个指标最佳
+                    best_ckpt_path = ckpt_output_dir / f'{args.name}_best_{metric_name}_{best_epe:.4f}_step{total_steps}.pth'
                     torch.save(model.state_dict(), best_ckpt_path)
-                    logging.info(f"✓ New best EPE: {current_epe:.4f}, saved to {best_ckpt_path}")
+                    logging.info(f"✓ New best {metric_name}: {best_epe:.4f}, saved to {best_ckpt_path}")
 
                 model.train()
                 model.module.freeze_bn()
+                # ================= [FIX END] =================
 
             total_steps += 1
 
@@ -632,7 +689,7 @@ if __name__ == '__main__':
     parser.add_argument('--restore_ckpt', default=None, help="load the weights from a specific checkpoint")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--warmup_pct', type=float, default=0.05, help="warmup percentage for OneCycleLR (0.05 = 5%)")
-    parser.add_argument('--da_weight_mode', type=str, default='schedule', choices=['fixed', 'schedule'])
+    parser.add_argument('--da_weight_mode', type=str, default='fixed', choices=['fixed', 'schedule'])
     parser.add_argument('--use_constant_lr', action='store_true')
     parser.add_argument('--num_steps', type=int, default=300000, help="length of training schedule.")
     parser.add_argument('--batch_size', type=int, default=4, help="batch size used during training.")
@@ -643,8 +700,8 @@ if __name__ == '__main__':
     parser.add_argument('--train_iters', type=int, default=12,
                         help="number of updates to the disparity field in each forward pass.")
 
-    parser.add_argument('--mixed_precision', default=True, action='store_false', help='use mixed precision')
-    parser.add_argument('--precision_dtype', default='bfloat16', choices=['float16', 'bfloat16', 'float32'],
+    parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
+    parser.add_argument('--precision_dtype', default='float32', choices=['float16', 'bfloat16', 'float32'],
                         help='Choose precision type: float16 or bfloat16 or float32')
     parser.add_argument('--logdir', default='/root/autodl-tmp/stereo/logs/our3_211',
                         help='the directory to save logs and checkpoints')
@@ -676,7 +733,7 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
 
     parser.add_argument('--edge_scale', type=float, default=1.0, help='Initial edge weight scale factor')
-    parser.add_argument('--edge_scale_mode', type=str, default='schedule', choices=['fixed', 'schedule', 'adaptive'])
+    parser.add_argument('--edge_scale_mode', type=str, default='fixed', choices=['fixed', 'schedule', 'adaptive'])
     parser.add_argument('--edge_scale_min', type=float, default=0.5)
     parser.add_argument('--edge_scale_max', type=float, default=2.0)
     parser.add_argument('--edge_warmup_steps', type=int, default=5000)
@@ -686,9 +743,9 @@ if __name__ == '__main__':
     parser.add_argument('--depth_aware_edge', action='store_true', default=True, help='Enable GT depth-aware edge')
     parser.add_argument('--no_depth_aware_edge', dest='depth_aware_edge', action='store_false')
 
-    parser.add_argument('--rgb_edge_weight', type=float, default=0.9)
+    parser.add_argument('--rgb_edge_weight', type=float, default=0.5)
     parser.add_argument('--rgb_edge_weight_final', type=float, default=0.5)
-    parser.add_argument('--disp_edge_weight', type=float, default=0.05)
+    parser.add_argument('--disp_edge_weight', type=float, default=0.1)
     parser.add_argument('--disp_edge_weight_final', type=float, default=0.1)
     parser.add_argument('--da_warmup_steps', type=int, default=10000)
 
@@ -696,8 +753,18 @@ if __name__ == '__main__':
                         help='root directory for all datasets')
     parser.add_argument('--sceneflow_root', type=str, default=None, help='path to SceneFlow dataset')
     parser.add_argument('--kitti_root', type=str, default=None, help='path to KITTI dataset')
+
+    # [NEW] 添加对独立 KITTI 2012 / 2015 路径的支持
+    parser.add_argument('--kitti12_root', type=str, default=None, help='path to KITTI 2012 dataset')
+    parser.add_argument('--kitti15_root', type=str, default=None, help='path to KITTI 2015 dataset')
+
     parser.add_argument('--middlebury_root', type=str, default=None, help='path to Middlebury dataset')
     parser.add_argument('--eth3d_root', type=str, default=None, help='path to ETH3D dataset')
+
+    # [NEW] 添加评估数据集参数，支持多个 (nargs='+')
+    parser.add_argument('--eval_datasets', nargs='+', default=['eth3d'],
+                        choices=['sceneflow', 'kitti', 'eth3d', 'middlebury'],
+                        help='datasets for validation during training')
 
     args = parser.parse_args()
 
@@ -705,6 +772,13 @@ if __name__ == '__main__':
         args.sceneflow_root = os.path.join(args.dataset_root, 'SceneFlow')
     if args.kitti_root is None:
         args.kitti_root = os.path.join(args.dataset_root, 'KITTI')
+
+    # [NEW] 设置 KITTI 12/15 的默认路径
+    if args.kitti12_root is None:
+        args.kitti12_root = os.path.join(args.dataset_root, 'KITTI/KITTI_2012')
+    if args.kitti15_root is None:
+        args.kitti15_root = os.path.join(args.dataset_root, 'KITTI/KITTI_2015')
+
     if args.middlebury_root is None:
         args.middlebury_root = os.path.join(args.dataset_root, 'Middlebury/MiddEval3')
     if args.eth3d_root is None:

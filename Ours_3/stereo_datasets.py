@@ -12,118 +12,194 @@ from pathlib import Path
 from glob import glob
 import os.path as osp
 
+from PIL import Image
 import frame_utils
-from augmentor import FlowAugmentor, SparseFlowAugmentor
+
+
+def readPFM(file):
+    file = open(file, 'rb')
+
+    color = None
+    width = None
+    height = None
+    scale = None
+    endian = None
+
+    header = file.readline().rstrip()
+    if header.decode("ascii") == 'PF':
+        color = True
+    elif header.decode("ascii") == 'Pf':
+        color = False
+    else:
+        raise Exception('Not a PFM file.')
+
+    dim_match = re.match(r'^(\d+)\s(\d+)\s$', file.readline().decode("ascii"))
+    if dim_match:
+        width, height = map(int, dim_match.groups())
+    else:
+        raise Exception('Malformed PFM header.')
+
+    scale = float(file.readline().rstrip())
+    if scale < 0:  # little-endian
+        endian = '<'
+        scale = -scale
+    else:
+        endian = '>'  # big-endian
+
+    data = np.fromfile(file, endian + 'f')
+    shape = (height, width, 3) if color else (height, width)
+
+    data = np.reshape(data, shape)
+    data = np.flipud(data)
+    return data, scale
+
+
+def load_image(imfile):
+    img = np.array(Image.open(imfile)).astype(np.uint8)
+    img = torch.from_numpy(img).permute(2, 0, 1).float()
+    return img[None]
+
+
+def load_disp(dispfile):
+    if dispfile.endswith('.pfm'):
+        disp, scale = readPFM(dispfile)
+        disp = disp.copy()
+    else:
+        disp = np.array(Image.open(dispfile))
+
+    disp = torch.from_numpy(disp).float()
+    return disp[None]
 
 
 class StereoDataset(data.Dataset):
     def __init__(self, aug_params=None, sparse=False, reader=None):
-        self.augmentor = None
+        self.aug_params = aug_params
         self.sparse = sparse
-        self.img_pad = aug_params.pop("img_pad", None) if aug_params is not None else None
-        if aug_params is not None and "crop_size" in aug_params:
-            if sparse:
-                self.augmentor = SparseFlowAugmentor(**aug_params)
-            else:
-                self.augmentor = FlowAugmentor(**aug_params)
+        self.img_list = []
+        self.disparity_list = []
 
         if reader is None:
-            self.disparity_reader = frame_utils.read_gen
+            self.reader = frame_utils.read_gen
         else:
-            self.disparity_reader = reader        
-
-        self.is_test = False
-        self.init_seed = False
-        self.flow_list = []
-        self.disparity_list = []
-        self.image_list = []
-        self.extra_info = []
+            self.reader = reader
 
     def __getitem__(self, index):
+        flow = None
+        disp = None
 
-        if self.is_test:
-            img1 = frame_utils.read_gen(self.image_list[index][0])
-            img2 = frame_utils.read_gen(self.image_list[index][1])
-            img1 = np.array(img1).astype(np.uint8)[..., :3]
-            img2 = np.array(img2).astype(np.uint8)[..., :3]
-            img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
-            img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
-            return img1, img2, self.extra_info[index]
+        img1 = np.array(Image.open(self.img_list[index][0])).astype(np.uint8)
+        img2 = np.array(Image.open(self.img_list[index][1])).astype(np.uint8)
 
-        if not self.init_seed:
-            worker_info = torch.utils.data.get_worker_info()
-            if worker_info is not None:
-                torch.manual_seed(worker_info.id)
-                np.random.seed(worker_info.id)
-                random.seed(worker_info.id)
-                self.init_seed = True
-
-        index = index % len(self.image_list)
-        disp = self.disparity_reader(self.disparity_list[index])
-        
-        if isinstance(disp, tuple):
-            disp, valid = disp
+        if self.disparity_list[index].endswith('.pfm'):
+            disp, scale = readPFM(self.disparity_list[index])
+            disp = disp.astype(np.float32)
         else:
-            valid = disp < 512
+            disp = np.array(Image.open(self.disparity_list[index])).astype(np.float32) / 256.0
 
-        img1 = frame_utils.read_gen(self.image_list[index][0])
-        img2 = frame_utils.read_gen(self.image_list[index][1])
-
-        img1 = np.array(img1).astype(np.uint8)
-        img2 = np.array(img2).astype(np.uint8)
-
-        disp = np.array(disp).astype(np.float32)
-
-        flow = np.stack([disp, np.zeros_like(disp)], axis=-1)
-
-        # grayscale images
         if len(img1.shape) == 2:
-            img1 = np.tile(img1[...,None], (1, 1, 3))
-            img2 = np.tile(img2[...,None], (1, 1, 3))
+            img1 = np.tile(img1[..., None], (1, 1, 3))
+            img2 = np.tile(img2[..., None], (1, 1, 3))
         else:
             img1 = img1[..., :3]
             img2 = img2[..., :3]
 
-        if self.augmentor is not None:
+        if self.aug_params is not None:
             if self.sparse:
-                img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
+                img1, img2, disp, valid = self.augment_sparse(img1, img2, disp, self.aug_params)
             else:
-
-                img1, img2, flow = self.augmentor(img1, img2, flow)
+                img1, img2, disp = self.augment_dense(img1, img2, disp, self.aug_params)
+                valid = (disp < 512) & (disp > 0)  # 标准有效性检查
+        else:
+            # No augmentation: create valid mask from disparity
+            valid = (disp < 512) & (disp > 0)
 
         img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
         img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
-        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
+        disp = torch.from_numpy(disp)
+        valid = torch.from_numpy(valid).float()
 
-        if self.sparse:
-            valid = torch.from_numpy(valid)
-        else:
-            valid = (flow[0].abs() < 512) & (flow[1].abs() < 512)
+        # Always add channel dimension for consistency
+        disp = disp[None]  # [H, W] -> [1, H, W]
+        valid = valid[None]  # [H, W] -> [1, H, W]
 
-        if self.img_pad is not None:
+        # Return file paths for validation, index for training
+        img1_path, img2_path = self.img_list[index]
+        disp_path = self.disparity_list[index]
 
-            padH, padW = self.img_pad
-            img1 = F.pad(img1, [padW]*2 + [padH]*2)
-            img2 = F.pad(img2, [padW]*2 + [padH]*2)
+        return (img1_path, img2_path, disp_path), img1, img2, disp, valid
 
-        flow = flow[:1]
-        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float()
+    def augment_dense(self, img1, img2, disp, aug_params):
+        """
+        密集视差增强 (用于 SceneFlow)
+        """
+        h, w = img1.shape[:2]
+        crop_h, crop_w = aug_params['crop_size']
 
+        # ================= [FIX START] 自动 Padding 逻辑 =================
+        # 如果图片比裁剪尺寸小，先进行 Padding，防止 random_crop 报错或输出尺寸不一致
+        pad_h = max(crop_h - h, 0)
+        pad_w = max(crop_w - w, 0)
+        if pad_h > 0 or pad_w > 0:
+            img1 = np.pad(img1, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+            img2 = np.pad(img2, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+            disp = np.pad(disp, ((0, pad_h), (0, pad_w)), mode='constant')
+            # 更新宽高
+            h, w = img1.shape[:2]
+        # ================= [FIX END] =====================================
 
-    def __mul__(self, v):
-        copy_of_self = copy.deepcopy(self)
-        copy_of_self.flow_list = v * copy_of_self.flow_list
-        copy_of_self.image_list = v * copy_of_self.image_list
-        copy_of_self.disparity_list = v * copy_of_self.disparity_list
-        copy_of_self.extra_info = v * copy_of_self.extra_info
-        return copy_of_self
-        
+        # Random Crop
+        y1 = random.randint(0, h - crop_h)
+        x1 = random.randint(0, w - crop_w)
+
+        img1 = img1[y1:y1 + crop_h, x1:x1 + crop_w]
+        img2 = img2[y1:y1 + crop_h, x1:x1 + crop_w]
+        disp = disp[y1:y1 + crop_h, x1:x1 + crop_w]
+
+        # 颜色增强等其他操作...
+        if random.random() < 0.5 and aug_params.get('do_flip', False):
+            img1 = np.flipud(img1)
+            img2 = np.flipud(img2)
+            disp = np.flipud(disp)
+
+        return img1, img2, disp
+
+    def augment_sparse(self, img1, img2, disp, aug_params):
+        """
+        稀疏视差增强 (用于 KITTI, ETH3D, Middlebury)
+        """
+        h, w = img1.shape[:2]
+        crop_h, crop_w = aug_params['crop_size']
+
+        # ================= [FIX START] 自动 Padding 逻辑 =================
+        pad_h = max(crop_h - h, 0)
+        pad_w = max(crop_w - w, 0)
+        if pad_h > 0 or pad_w > 0:
+            img1 = np.pad(img1, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+            img2 = np.pad(img2, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+            disp = np.pad(disp, ((0, pad_h), (0, pad_w)), mode='constant')
+
+        # 更新宽高
+        h, w = img1.shape[:2]
+        # ================= [FIX END] =====================================
+
+        y1 = random.randint(0, h - crop_h)
+        x1 = random.randint(0, w - crop_w)
+
+        img1 = img1[y1:y1 + crop_h, x1:x1 + crop_w]
+        img2 = img2[y1:y1 + crop_h, x1:x1 + crop_w]
+        disp = disp[y1:y1 + crop_h, x1:x1 + crop_w]
+
+        # Valid mask (GT > 0)
+        valid = (disp > 0)
+
+        return img1, img2, disp, valid
+
     def __len__(self):
-        return len(self.image_list)
+        return len(self.img_list)
 
 
 class SceneFlowDatasets(StereoDataset):
-    def __init__(self, aug_params=None, root='./dataset_cache/SceneFlow', dstype='frames_finalpass', things_test=False):
+    def __init__(self, aug_params=None, root='/data/SceneFlow', dstype='frames_finalpass', things_test=False):
         super(SceneFlowDatasets, self).__init__(aug_params)
         self.root = root
         self.dstype = dstype
@@ -136,155 +212,102 @@ class SceneFlowDatasets(StereoDataset):
             self._add_driving("TRAIN")
 
     def _add_things(self, split='TRAIN'):
-        """ Add FlyingThings3D data """
-
-        original_length = len(self.disparity_list)
+        """ 加载 FlyingThings3D """
+        original_length = len(self.img_list)
         root = osp.join(self.root, 'FlyingThings3D')
-        left_images = sorted( glob(osp.join(root, self.dstype, split, '*/*/left/*.png')) )
-        right_images = [ im.replace('left', 'right') for im in left_images ]
-        disparity_images = [ im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images ]
+        left_images = sorted(glob(osp.join(root, self.dstype, split, '*/*/left/*.png')))
+        right_images = [im.replace('left', 'right') for im in left_images]
+        disparity_images = [im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images]
 
-        state = np.random.get_state()
-        np.random.seed(1000)
-        # val_idxs = set(np.random.permutation(len(left_images))[:100])
-        val_idxs = set(np.random.permutation(len(left_images)))
-        np.random.set_state(state)
+        for img1, img2, disp in zip(left_images, right_images, disparity_images):
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
+        logging.info(f"Added {len(self.img_list) - original_length} from FlyingThings {self.dstype}")
 
-        for idx, (img1, img2, disp) in enumerate(zip(left_images, right_images, disparity_images)):
-            if (split == 'TEST' and idx in val_idxs) or split == 'TRAIN':
-                self.image_list += [ [img1, img2] ]
-                self.disparity_list += [ disp ]
-        logging.info(f"Added {len(self.disparity_list) - original_length} from FlyingThings {self.dstype}")
-
-    def _add_monkaa(self, split="TRAIN"):
-        """ Add Monkaa data """
-
-        original_length = len(self.disparity_list)
+    def _add_monkaa(self, split='TRAIN'):
+        """ 加载 Monkaa """
+        original_length = len(self.img_list)
         root = osp.join(self.root, 'Monkaa')
-        left_images = sorted( glob(osp.join(root, self.dstype, split, '*/left/*.png')) )
-        right_images = [ image_file.replace('left', 'right') for image_file in left_images ]
-        disparity_images = [ im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images ]
+        left_images = sorted(glob(osp.join(root, self.dstype, '*/*/left/*.png')))
+        right_images = [im.replace('left', 'right') for im in left_images]
+        disparity_images = [im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images]
 
         for img1, img2, disp in zip(left_images, right_images, disparity_images):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-        logging.info(f"Added {len(self.disparity_list) - original_length} from Monkaa {self.dstype}")
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
+        logging.info(f"Added {len(self.img_list) - original_length} from Monkaa {self.dstype}")
 
-
-    def _add_driving(self, split="TRAIN"):
-        """ Add Driving data """
-
-        original_length = len(self.disparity_list)
+    def _add_driving(self, split='TRAIN'):
+        """ 加载 Driving """
+        original_length = len(self.img_list)
         root = osp.join(self.root, 'Driving')
-        left_images = sorted( glob(osp.join(root, self.dstype, split, '*/*/*/left/*.png')) )
-        right_images = [ image_file.replace('left', 'right') for image_file in left_images ]
-        disparity_images = [ im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images ]
+        left_images = sorted(glob(osp.join(root, self.dstype, '*/*/*/left/*.png')))
+        right_images = [im.replace('left', 'right') for im in left_images]
+        disparity_images = [im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images]
 
         for img1, img2, disp in zip(left_images, right_images, disparity_images):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-        logging.info(f"Added {len(self.disparity_list) - original_length} from Driving {self.dstype}")
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
+        logging.info(f"Added {len(self.img_list) - original_length} from Driving {self.dstype}")
 
 
 class ETH3D(StereoDataset):
-    def __init__(self, aug_params=None, root='./dataset_cache/ETH3D', split='training'):
+    def __init__(self, aug_params=None, root='/data/ETH3D', split='training'):
         super(ETH3D, self).__init__(aug_params, sparse=True)
 
-        image1_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im0.png')) )
-        image2_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im1.png')) )
-        disp_list = sorted( glob(osp.join(root, 'two_view_training_gt/*/disp0GT.pfm')) ) if split == 'training' else [osp.join(root, 'two_view_training_gt/playground_1l/disp0GT.pfm')]*len(image1_list)
+        image1_list = sorted(glob(osp.join(root, 'two_view_training', '*', 'im0.png')))
+        image2_list = sorted(glob(osp.join(root, 'two_view_training', '*', 'im1.png')))
+        disp_list = sorted(glob(osp.join(root, 'two_view_training_gt', '*', 'disp0GT.pfm')))
 
         for img1, img2, disp in zip(image1_list, image2_list, disp_list):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-
-class SintelStereo(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/SintelStereo'):
-        super().__init__(aug_params, sparse=True, reader=frame_utils.readDispSintelStereo)
-
-        image1_list = sorted( glob(osp.join(root, 'training/*_left/*/frame_*.png')) )
-        image2_list = sorted( glob(osp.join(root, 'training/*_right/*/frame_*.png')) )
-        disp_list = sorted( glob(osp.join(root, 'training/disparities/*/frame_*.png')) ) * 2
-
-        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
-            assert img1.split('/')[-2:] == disp.split('/')[-2:]
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-
-class FallingThings(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/FallingThings'):
-        super().__init__(aug_params, reader=frame_utils.readDispFallingThings)
-        assert os.path.exists(root)
-
-        with open(os.path.join(root, 'filenames.txt'), 'r') as f:
-            filenames = sorted(f.read().splitlines())
-
-        image1_list = [osp.join(root, e) for e in filenames]
-        image2_list = [osp.join(root, e.replace('left.jpg', 'right.jpg')) for e in filenames]
-        disp_list = [osp.join(root, e.replace('left.jpg', 'left.depth.png')) for e in filenames]
-
-        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-
-class TartanAir(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets', keywords=[]):
-        super().__init__(aug_params, reader=frame_utils.readDispTartanAir)
-        assert os.path.exists(root)
-
-        with open(os.path.join(root, 'tartanair_filenames.txt'), 'r') as f:
-            filenames = sorted(list(filter(lambda s: 'seasonsforest_winter/Easy' not in s, f.read().splitlines())))
-            for kw in keywords:
-                filenames = sorted(list(filter(lambda s: kw in s.lower(), filenames)))
-
-        image1_list = [osp.join(root, e) for e in filenames]
-        image2_list = [osp.join(root, e.replace('_left', '_right')) for e in filenames]
-        disp_list = [osp.join(root, e.replace('image_left', 'depth_left').replace('left.png', 'left_depth.npy')) for e in filenames]
-
-        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-
-class KITTI(StereoDataset):
-    def __init__(self, aug_params=None, root='./dataset_cache/KITTI', image_set='training'):
-        super(KITTI, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispKITTI)
-        assert os.path.exists(root), f"KITTI root path does not exist: {root}"
-
-        root_12 = osp.join(root, 'KITTI_2012')
-        image1_list = sorted(glob(os.path.join(root_12, image_set, 'colored_0/*_10.png')))
-        image2_list = sorted(glob(os.path.join(root_12, image_set, 'colored_1/*_10.png')))
-        disp_list = sorted(glob(os.path.join(root_12, 'training', 'disp_occ/*_10.png'))) if image_set == 'training' else [osp.join(root_12, 'training/disp_occ/000085_10.png')]*len(image1_list)
-
-        root_15 = osp.join(root, 'KITTI_2015')
-        image1_list += sorted(glob(os.path.join(root_15, image_set, 'image_2/*_10.png')))
-        image2_list += sorted(glob(os.path.join(root_15, image_set, 'image_3/*_10.png')))
-        disp_list += sorted(glob(os.path.join(root_15, 'training', 'disp_occ_0/*_10.png'))) if image_set == 'training' else [osp.join(root_15, 'training/disp_occ_0/000085_10.png')]*len(image1_list)
-
-        for idx, (img1, img2, disp) in enumerate(zip(image1_list, image2_list, disp_list)):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
 
 
 class Middlebury(StereoDataset):
-    def __init__(self, aug_params=None, root='./dataset_cache/Middlebury/MiddEval3', split='F'):
-        super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury)
-        assert os.path.exists(root), f"Middlebury root path does not exist: {root}"
-        assert split in "FHQ"
-        lines = list(map(osp.basename, glob(os.path.join(root, "trainingH/*"))))
-        image1_list = sorted([os.path.join(root, f'training{split}', f'{name}/im0.png') for name in lines])
-        image2_list = sorted([os.path.join(root, f'training{split}', f'{name}/im1.png') for name in lines])
-        disp_list = sorted([os.path.join(root, f'training{split}', f'{name}/disp0GT.pfm') for name in lines])
+    def __init__(self, aug_params=None, root='/data/Middlebury', split='training'):
+        super(Middlebury, self).__init__(aug_params, sparse=True)
+        # 支持 Middlebury 2014 标准结构
+        image1_list = sorted(glob(osp.join(root, 'trainingH', '*', 'im0.png')))
+        image2_list = sorted(glob(osp.join(root, 'trainingH', '*', 'im1.png')))
+        disp_list = sorted(glob(osp.join(root, 'trainingH', '*', 'disp0GT.pfm')))
 
-        assert len(image1_list) == len(image2_list) == len(disp_list) > 0, [image1_list, split]
         for img1, img2, disp in zip(image1_list, image2_list, disp_list):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
 
-  
+
+class KITTI(StereoDataset):
+    def __init__(self, aug_params=None, root='/data/KITTI', split='training'):
+        super(KITTI, self).__init__(aug_params, sparse=True)
+
+        # KITTI 2015
+        root15 = osp.join(root, 'KITTI_2015/training')
+        image1_list = sorted(glob(osp.join(root15, 'image_2/*_10.png')))
+        image2_list = sorted(glob(osp.join(root15, 'image_3/*_10.png')))
+        disp_list = sorted(glob(osp.join(root15, 'disp_occ_0/*_10.png')))
+
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
+
+        # KITTI 2012
+        root12 = osp.join(root, 'KITTI_2012/training')
+        image1_list = sorted(glob(osp.join(root12, 'colored_0/*_10.png')))
+        image2_list = sorted(glob(osp.join(root12, 'colored_1/*_10.png')))
+        disp_list = sorted(glob(osp.join(root12, 'disp_occ/*_10.png')))
+
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            self.img_list.append((img1, img2))
+            self.disparity_list.append(disp)
+
+
 def fetch_dataloader(args):
-    """ Create the data loader for the corresponding trainign set """
+    """ 创建 DataLoader """
 
-    aug_params = {'crop_size': args.image_size, 'min_scale': args.spatial_scale[0], 'max_scale': args.spatial_scale[1], 'do_flip': False, 'yjitter': not args.noyjitter}
+    # 定义数据增强参数 (包含 crop size)
+    aug_params = {'crop_size': args.image_size, 'min_scale': args.spatial_scale[0], 'max_scale': args.spatial_scale[1],
+                  'do_flip': False, 'yjitter': not args.noyjitter}
     if hasattr(args, "saturation_range") and args.saturation_range is not None:
         aug_params["saturation_range"] = args.saturation_range
     if hasattr(args, "img_gamma") and args.img_gamma is not None:
@@ -292,40 +315,29 @@ def fetch_dataloader(args):
     if hasattr(args, "do_flip") and args.do_flip is not None:
         aug_params["do_flip"] = args.do_flip
 
-
     train_dataset = None
+
+    # 根据参数混合数据集
     for dataset_name in args.train_datasets:
-        if re.compile("middlebury_.*").fullmatch(dataset_name):
-            middlebury_root = getattr(args, 'middlebury_root', '/root/autodl-tmp/stereo/dataset_cache/Middlebury/MiddEval3')
-            new_dataset = Middlebury(aug_params, root=middlebury_root, split=dataset_name.replace('middlebury_',''))
-            logging.info(f"Adding {len(new_dataset)} samples from Middlebury")
-        elif dataset_name == 'sceneflow':
-            sceneflow_root = getattr(args, 'sceneflow_root', '/root/autodl-tmp/stereo/dataset_cache/SceneFlow')
-            final_dataset = SceneFlowDatasets(aug_params, root=sceneflow_root, dstype='frames_finalpass')
-            new_dataset = final_dataset
-            logging.info(f"Adding {len(new_dataset)} samples from SceneFlow")
+        if 'sceneflow' in dataset_name:
+            new_dataset = SceneFlowDatasets(aug_params, root=args.sceneflow_root, dstype='frames_finalpass')
         elif 'kitti' in dataset_name:
-            kitti_root = getattr(args, 'kitti_root', '/root/autodl-tmp/stereo/dataset_cache/KITTI')
-            new_dataset = KITTI(aug_params, root=kitti_root)
-            logging.info(f"Adding {len(new_dataset)} samples from KITTI")
-        elif dataset_name == 'eth3d':
-            eth3d_root = getattr(args, 'eth3d_root', '/root/autodl-tmp/stereo/dataset_cache/ETH3D')
-            new_dataset = ETH3D(aug_params, root=eth3d_root)
-            logging.info(f"Adding {len(new_dataset)} samples from ETH3D")
-        elif dataset_name == 'sintel_stereo':
-            new_dataset = SintelStereo(aug_params)*140
-            logging.info(f"Adding {len(new_dataset)} samples from Sintel Stereo")
-        elif dataset_name == 'falling_things':
-            new_dataset = FallingThings(aug_params)*5
-            logging.info(f"Adding {len(new_dataset)} samples from FallingThings")
-        elif dataset_name.startswith('tartan_air'):
-            new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
-            logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
-        train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
+            # 兼容 kitti, kitti15, kitti12 写法
+            new_dataset = KITTI(aug_params, root=args.kitti_root)  # KITTI 类内部已经处理了 12+15 的加载
+        elif 'middlebury' in dataset_name:
+            new_dataset = Middlebury(aug_params, root=args.middlebury_root)
+        elif 'eth3d' in dataset_name:
+            new_dataset = ETH3D(aug_params, root=args.eth3d_root)
 
+        if train_dataset is None:
+            train_dataset = new_dataset
+        else:
+            train_dataset = data.ConcatDataset([train_dataset, new_dataset])
+
+    logging.info(f"Training with {len(train_dataset)} image pairs")
+
+    # 核心：num_workers 可以根据CPU情况调整，通常 4-8
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size,
-        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 8)), drop_last=True, persistent_workers=True, prefetch_factor=2)
+                                   pin_memory=True, shuffle=True, num_workers=4, drop_last=True)
 
-    logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
-

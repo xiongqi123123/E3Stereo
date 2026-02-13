@@ -293,9 +293,12 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False, device=Non
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--restore_ckpt', help="restore checkpoint", default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth')
+    parser.add_argument('--restore_ckpt', help="restore checkpoint",
+                        # default='/root/autodl-tmp/stereo/model_cache/sceneflow.pth'
+                        default = '../logs/our3_211/195000_gt_lr0002.pth'
+                        )
     # parser.add_argument('--restore_ckpt', help="restore checkpoint", default='/root/autodl-tmp/stereo/logs/edge_d1_26/188500_igev_edge_pt_2_6.pth')
-    parser.add_argument('--restore_ckpt', help="restore checkpoint", default='/root/autodl-tmp/stereo/logs/edge_d1_26/190000_igev_edge_pt_2_6.pth')
+    # parser.add_argument('--restore_ckpt', help="restore checkpoint", default='/root/autodl-tmp/stereo/logs/edge_d1_26/190000_igev_edge_pt_2_6.pth')
 
     parser.add_argument('--dataset', help="dataset for evaluation", default='sceneflow', choices=["eth3d", "kitti", "sceneflow"] + [f"middlebury_{s}" for s in 'FHQ'])
     parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
