@@ -421,6 +421,19 @@ class IGEVStereo(nn.Module):
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
+    def freeze_for_edge_finetune(self):
+        """
+        冻结 backbone 和 Stereo 分支，仅微调 edge_head + edge_refine。
+        需 edge_source='shared' 时才有 edge_head/edge_refine。
+        """
+        if not self.edge_shared_backbone:
+            raise ValueError("freeze_for_edge_finetune 需要 edge_source='shared'（存在 edge_head/edge_refine）")
+        for name, param in self.named_parameters():
+            if name.startswith('edge_head.') or name.startswith('edge_refine.'):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
     def upsample_disp(self, disp, mask_feat_4, stem_2x, left_edge=None):
         """
         将 1/4 分辨率视差上采样到全分辨率。
@@ -434,8 +447,8 @@ class IGEVStereo(nn.Module):
                 edge_resized = F.interpolate(
                     left_edge,
                     size=xspx.shape[2:],
-                    # mode='bilinear',
-                    mode='nearest'
+                    mode='bilinear',
+                    # mode='nearest'
                 )
                 if self.edge_upsample_fusion_mode == 'concat':
                     xspx_with_edge = torch.cat([xspx, edge_resized], dim=1)
@@ -541,8 +554,8 @@ class IGEVStereo(nn.Module):
             gwc_feat = features_left[0]
             if self.edge_guided_gwc and left_edge is not None:
                 edge_resized = F.interpolate(
-                    # left_edge, size=gwc_feat.shape[2:], mode='bilinear', align_corners=False
-                    left_edge, size=gwc_feat.shape[2:], mode='nearest'
+                    left_edge, size=gwc_feat.shape[2:], mode='bilinear', align_corners=False
+                    # left_edge, size=gwc_feat.shape[2:], mode='nearest'
                 )
                 if self.edge_gwc_fusion_mode == 'concat':
                     feat_with_edge = torch.cat([gwc_feat, edge_resized], dim=1)
@@ -564,8 +577,8 @@ class IGEVStereo(nn.Module):
                     idx = i - 1
                     edge_resized = F.interpolate(
                         left_edge, size=features_left[i].shape[2:],
-                        # mode='bilinear', align_corners=False
-                        mode='nearest'
+                        mode='bilinear', align_corners=False
+                        # mode='nearest'
                     )
                     feat = features_left[i]
                     if self.edge_cost_agg_fusion_mode == 'concat':
@@ -593,8 +606,8 @@ class IGEVStereo(nn.Module):
                 # ================== Edge-Guided Upsampling (init_disp) ====================##
                 if self.edge_guided_upsample and left_edge is not None:
                     edge_resized = F.interpolate(
-                        # left_edge, size=xspx.shape[2:], mode='bilinear', align_corners=False
-                        left_edge, size=xspx.shape[2:], mode='nearest'
+                        left_edge, size=xspx.shape[2:], mode='bilinear', align_corners=False
+                        # left_edge, size=xspx.shape[2:], mode='nearest'
                     )
                     if self.edge_upsample_fusion_mode == 'concat':
                         xspx_with_edge = torch.cat([xspx, edge_resized], dim=1)
@@ -624,8 +637,8 @@ class IGEVStereo(nn.Module):
                     edge_resized = F.interpolate(
                         left_edge,
                         size=inp_list[i].shape[2:],
-                        # mode='bilinear',
-                        mode='nearest'
+                        mode='bilinear',
+                        # mode='nearest'
                     )
                     ctx = inp_list[i]
                     if self.edge_fusion_mode == 'concat':

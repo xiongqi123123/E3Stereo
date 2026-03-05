@@ -1,17 +1,15 @@
-name=estero-50K-KITTI-shared-edgeaware-0.5-3.0-0.5-refinement0.1-Acc2
+name=estero-20K-eth3d-ftedge-shared
 restore_ckpt=/home/qi.xiong/StereoMatching/IGEV-Improve/EStereo/checkpoints/estero-20W-shared-edgeaware-0.5-3.0-0.5-refinement0.1-Acc2/200000_estero-20W-shared-edgeaware-0.5-3.0-0.5-refinement0.1-Acc2.pth
 # restore_ckpt=None
 logdir=./checkpoints/$name
 batch_size=4
 accumulate_steps=2
 # train_datasets=sceneflow
-train_datasets=kitti
+train_datasets=eth3d
 lr=0.0002
 num_steps=50000
 # 单卡 + 梯度累积实现等效 batch8（避免多卡 NCCL 报错）
-export CUDA_VISIBLE_DEVICES=1
-# 缓解显存碎片化 OOM（PyTorch 2.0+）
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=4
 
 echo "================================================"
 echo "Training $name (effective batch=$((batch_size * accumulate_steps)))"
@@ -28,7 +26,8 @@ python train_stereo.py \
     --restore_ckpt $restore_ckpt \
     --edge_source shared \
     --edge_loss_weight 0.5 --edge_weight_epe_weight 3.0 --edge_aware_smoothness_weight 0.5 \
-    --edge_guided_refinement --refinement_loss_weight 0.1 
+    --edge_guided_refinement --refinement_loss_weight 0.1 \
+    # --freeze_for_edge_finetune
 
     
 

@@ -279,6 +279,41 @@ class SparseFlowAugmentor:
 
         return flow_img, valid_img
 
+    def _sample_crop_with_valid(self, valid, img_h, img_w, margin_y=20, margin_x=50, num_tries=12):
+        max_y = max(valid.shape[0] - img_h, 0)
+        max_x = max(valid.shape[1] - img_w, 0)
+
+        best_y0, best_x0 = 0, 0
+        best_count = -1
+
+        for _ in range(num_tries):
+            y0 = np.random.randint(0, max_y + margin_y + 1)
+            x0 = np.random.randint(-margin_x, max_x + margin_x + 1)
+
+            y0 = np.clip(y0, 0, max_y)
+            x0 = np.clip(x0, 0, max_x)
+
+            valid_crop = valid[y0:y0+img_h, x0:x0+img_w]
+            valid_count = int((valid_crop > 0).sum())
+
+            if valid_count > best_count:
+                best_count = valid_count
+                best_y0, best_x0 = y0, x0
+
+            if valid_count > 0:
+                return y0, x0
+
+        # fallback: center crop, then fallback to the best random sample
+        center_y0 = max_y // 2
+        center_x0 = max_x // 2
+        center_valid = valid[center_y0:center_y0+img_h, center_x0:center_x0+img_w]
+        center_count = int((center_valid > 0).sum())
+
+        if center_count > best_count:
+            return center_y0, center_x0
+
+        return best_y0, best_x0
+
     def spatial_transform(self, img1, img2, flow, valid, edge=None):
         # randomly sample scale
 
@@ -324,11 +359,13 @@ class SparseFlowAugmentor:
         margin_y = 20
         margin_x = 50
 
-        y0 = np.random.randint(0, img1.shape[0] - self.crop_size[0] + margin_y)
-        x0 = np.random.randint(-margin_x, img1.shape[1] - self.crop_size[1] + margin_x)
-
-        y0 = np.clip(y0, 0, img1.shape[0] - self.crop_size[0])
-        x0 = np.clip(x0, 0, img1.shape[1] - self.crop_size[1])
+        y0, x0 = self._sample_crop_with_valid(
+            valid,
+            self.crop_size[0],
+            self.crop_size[1],
+            margin_y=margin_y,
+            margin_x=margin_x,
+        )
 
         img1 = img1[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         img2 = img2[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
@@ -336,7 +373,19 @@ class SparseFlowAugmentor:
         valid = valid[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         if edge is not None:
             edge = edge[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
-        
+
+        # 当图像小于 crop_size 时（如未 resize 或边界情况），pad 到 crop_size 保证 batch 内尺寸一致
+        h, w = img1.shape[:2]
+        if h < self.crop_size[0] or w < self.crop_size[1]:
+            pad_b = max(0, self.crop_size[0] - h)
+            pad_r = max(0, self.crop_size[1] - w)
+            img1 = np.pad(img1, ((0, pad_b), (0, pad_r), (0, 0)), mode='edge')
+            img2 = np.pad(img2, ((0, pad_b), (0, pad_r), (0, 0)), mode='edge')
+            flow = np.pad(flow, ((0, pad_b), (0, pad_r), (0, 0)), mode='constant', constant_values=0)
+            valid = np.pad(valid, ((0, pad_b), (0, pad_r)), mode='constant', constant_values=0)
+            if edge is not None:
+                edge = np.pad(edge, ((0, pad_b), (0, pad_r)), mode='edge')
+
         if edge is not None:
             return img1, img2, flow, valid, edge
         else:

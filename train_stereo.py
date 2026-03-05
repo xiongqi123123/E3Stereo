@@ -1,6 +1,7 @@
 import os
 import argparse
 import logging
+import math
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -161,7 +162,8 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, ma
 
 def fetch_optimizer(args, model):
     """ Create the optimizer and learning rate scheduler """
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
 
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
             pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
@@ -216,12 +218,33 @@ class Logger:
         self.writer.close()
 
 
+def _get_model(model):
+    """DataParallel 时返回 model.module，否则返回 model"""
+    return model.module if hasattr(model, 'module') else model
+
+
 def train(args):
 
-    model = nn.DataParallel(IGEVStereo(args))
-    print("Parameter Count: %d" % count_parameters(model))
+    accumulate_steps = getattr(args, 'accumulate_steps', 1)
+    n_gpus = torch.cuda.device_count()
+    # 单卡 + 梯度累积时不用 DataParallel，避免 NCCL 问题
+    if n_gpus <= 1 or accumulate_steps > 1:
+        model = IGEVStereo(args)
+        if accumulate_steps > 1:
+            logging.info(f"Gradient accumulation: batch_size={args.batch_size} x {accumulate_steps} = effective batch {args.batch_size * accumulate_steps}")
+    else:
+        model = nn.DataParallel(IGEVStereo(args))
 
     train_loader = datasets.fetch_dataloader(args)
+
+    # 冻结 backbone + Stereo 分支，仅微调 edge_head + edge_refine
+    if getattr(args, 'freeze_for_edge_finetune', False):
+        _get_model(model).freeze_for_edge_finetune()
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        logging.info("Freeze backbone+stereo for edge finetune: trainable=%d, frozen=%d", trainable, frozen)
+
+    print("Parameter Count: %d" % count_parameters(model))
     optimizer, scheduler = fetch_optimizer(args, model)
     total_steps = 0
     logger = Logger(model, scheduler)
@@ -229,8 +252,11 @@ def train(args):
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
-        checkpoint = torch.load(args.restore_ckpt, map_location='cpu')
-        model.load_state_dict(checkpoint, strict=True)
+        checkpoint = torch.load(args.restore_ckpt, map_location='cpu', weights_only=False)
+        state = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        if isinstance(state, dict) and any(k.startswith("module.") for k in state.keys()):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+        _get_model(model).load_state_dict(state, strict=True)
         logging.info(f"Done loading checkpoint")
     if getattr(args, 'edge_init_from_geo', None) and getattr(args, 'edge_source', None) == 'shared':
         logging.info("Loading edge_head + edge_refine from GeoEdgeNet...")
@@ -246,22 +272,26 @@ def train(args):
                 state_to_load[k] = v
             elif k.startswith("refine."):
                 state_to_load["edge_refine." + k[7:]] = v
-        model.module.load_state_dict(state_to_load, strict=False)
+        _get_model(model).load_state_dict(state_to_load, strict=False)
         logging.info(f"Loaded {len(state_to_load)} keys from GeoEdgeNet")
     model.cuda()
     model.train()
-    model.module.freeze_bn() # We keep BatchNorm frozen
+    _get_model(model).freeze_bn()  # We keep BatchNorm frozen
 
-    validation_frequency = 10000
+    validation_frequency = 5000
 
     scaler = GradScaler(enabled=args.mixed_precision)
 
     should_keep_training = True
     global_batch_num = 0
+    accum_metrics = {}
+    total_batches_seen = 0
     while should_keep_training:
 
         for i_batch, (meta, *data_blob) in enumerate(tqdm(train_loader)):
-            optimizer.zero_grad()
+            total_batches_seen += 1
+            if (i_batch % accumulate_steps) == 0:
+                optimizer.zero_grad(set_to_none=True)
             # data_blob: image1, image2, disp_gt, valid；若有 GT edge 则多一维
             if len(data_blob) == 5:
                 image1, image2, disp_gt, valid, gt_edge = [x.cuda() if x is not None else None for x in data_blob]
@@ -269,10 +299,19 @@ def train(args):
                 image1, image2, disp_gt, valid = [x.cuda() for x in data_blob]
                 gt_edge = None
 
+            # 小数据集（如 KITTI ~100 batch/epoch）每 epoch 清缓存，避免显存碎片化 OOM；SceneFlow 每 epoch 也清一次无害
+            if i_batch == 0 and total_batches_seen > len(train_loader):
+                torch.cuda.empty_cache()
             # 模型输入：仅 edge_source=='gt' 时把数据集 edge 喂给模型；geo/rcf/shared 时用模型内部预测
             left_edge_for_model = gt_edge if (getattr(args, 'edge_source', None) == 'gt' and gt_edge is not None) else None
             assert model.training
-            out = model(image1, image2, iters=args.train_iters, left_edge=left_edge_for_model)
+            try:
+                out = model(image1, image2, iters=args.train_iters, left_edge=left_edge_for_model)
+            except torch.OutOfMemoryError:
+                logging.error(f"OOM at global_batch={global_batch_num}, i_batch={i_batch}. Skip this batch and clear CUDA cache.")
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                continue
             if isinstance(out, tuple) and len(out) == 4:
                 disp_init_pred, disp_preds, left_edge_out, edge_logits_out = out
             else:
@@ -296,38 +335,100 @@ def train(args):
                     gt_e = gt_e.unsqueeze(1)
                 if gt_e.shape[-2:] != edge_logits_out.shape[-2:]:
                     gt_e = F.interpolate(gt_e, size=edge_logits_out.shape[-2:], mode='bilinear', align_corners=False)
-                edge_loss = F.binary_cross_entropy_with_logits(edge_logits_out, gt_e.clamp(0, 1), reduction='mean')
+                # 数值稳定：float32 + clamp 防止 mixed precision 下 BCE 溢出
+                logits_safe = edge_logits_out.float().clamp(-50.0, 50.0)
+                if getattr(args, 'edge_loss_valid_mask', False) and valid is not None:
+                    vm = valid.unsqueeze(1).float()
+                    if vm.shape[-2:] != logits_safe.shape[-2:]:
+                        vm = F.interpolate(vm, size=logits_safe.shape[-2:], mode='nearest')
+                    loss_per_pixel = F.binary_cross_entropy_with_logits(logits_safe, gt_e.clamp(0, 1), reduction='none')
+                    n_valid = vm.sum().clamp(min=1.0)
+                    edge_loss = (loss_per_pixel * vm).sum() / n_valid
+                else:
+                    edge_loss = F.binary_cross_entropy_with_logits(logits_safe, gt_e.clamp(0, 1), reduction='mean')
                 loss = loss + edge_loss_weight * edge_loss
                 metrics['edge_loss'] = edge_loss.item()
-            logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
-            logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
-            global_batch_num += 1
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # NaN 检测：跳过坏 batch，避免梯度污染导致模型崩溃
+            loss_val = loss.item()
+            if not math.isfinite(loss_val):
+                logging.warning(f"Step ~{global_batch_num * accumulate_steps}: NaN/Inf loss (={loss_val}), skipping batch to avoid corruption")
+                optimizer.zero_grad(set_to_none=True)
+                # 必须显式释放大 tensor 并清缓存，否则下一 batch 会因显存未释放而 OOM
+                del out, disp_init_pred, disp_preds, left_edge_out, edge_for_metrics
+                if edge_logits_out is not None:
+                    del edge_logits_out
+                del image1, image2, disp_gt, valid
+                if gt_edge is not None:
+                    del gt_edge
+                torch.cuda.empty_cache()
+                continue
+            # 梯度累积：loss 按步数缩放，使梯度正确累加
+            loss = loss / accumulate_steps
+            try:
+                scaler.scale(loss).backward()
+            except torch.OutOfMemoryError:
+                logging.error(f"OOM during backward at global_batch={global_batch_num}, i_batch={i_batch}. Skip this batch and clear CUDA cache.")
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                continue
+            for k, v in metrics.items():
+                accum_metrics[k] = accum_metrics.get(k, 0.0) + v
+            accum_metrics['_loss'] = accum_metrics.get('_loss', 0.0) + loss_val
 
-            scaler.step(optimizer)
-            scheduler.step()
-            scaler.update()
-            logger.push(metrics)
+            # 每个 micro-batch 都尽早释放大 tensor，避免高水位显存长期驻留导致后续随机 OOM
+            del out, disp_init_pred, disp_preds, left_edge_out, edge_for_metrics
+            if edge_logits_out is not None:
+                del edge_logits_out
+            del image1, image2, disp_gt, valid
+            if gt_edge is not None:
+                del gt_edge
 
-            if total_steps % validation_frequency == validation_frequency - 1:
-                save_path = Path(args.logdir + '/%d_%s.pth' % (total_steps + 1, args.name))
-                logging.info(f"Saving file {save_path.absolute()}")
-                torch.save(model.state_dict(), save_path)
-                if 'sceneflow' in args.train_datasets:
-                    results = validate_sceneflow(model.module, iters=args.valid_iters, args=args)
-                elif 'kitti' in args.train_datasets:
-                    results = validate_kitti(model.module, iters=args.valid_iters)
-                else: 
-                    raise Exception('Unknown validation dataset.')
-                logger.write_dict(results)
-                model.train()
-                model.module.freeze_bn()
+            if (i_batch + 1) % accumulate_steps == 0:
+                scaler.unscale_(optimizer)
+                params_to_clip = [p for p in model.parameters() if p.requires_grad]
+                torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                scaler.step(optimizer)
+                scheduler.step()
+                scaler.update()
+                if total_steps % 100 == 0:
+                    torch.cuda.empty_cache()
+                avg_loss = accum_metrics.pop('_loss', 0.0) / accumulate_steps
+                avg_metrics = {k: v / accumulate_steps for k, v in accum_metrics.items()}
+                logger.writer.add_scalar("live_loss", avg_loss, global_batch_num)
+                logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+                global_batch_num += 1
+                logger.push(avg_metrics)
+                accum_metrics = {}
+                total_steps += 1
 
-            total_steps += 1
+                if total_steps % validation_frequency == validation_frequency - 1:
+                    save_path = Path(args.logdir + '/%d_%s.pth' % (total_steps + 1, args.name))
+                    logging.info(f"Saving file {save_path.absolute()}")
+                    torch.save(model.state_dict(), save_path)
+                    if 'sceneflow' in args.train_datasets:
+                        results = validate_sceneflow(_get_model(model), iters=args.valid_iters, args=args)
+                    elif 'kitti' in args.train_datasets:
+                        results = validate_kitti(_get_model(model), iters=args.valid_iters)
+                    elif 'eth3d' in args.train_datasets:
+                        results = validate_eth3d(_get_model(model), iters=args.valid_iters, mixed_prec=args.mixed_precision, args=args)
+                    else:
+                        # 未知数据集：用训练集做验证（取第一个）
+                        ds = args.train_datasets[0]
+                        if 'sceneflow' in ds:
+                            results = validate_sceneflow(_get_model(model), iters=args.valid_iters, args=args)
+                        elif 'kitti' in ds:
+                            results = validate_kitti(_get_model(model), iters=args.valid_iters)
+                        elif 'eth3d' in ds:
+                            results = validate_eth3d(_get_model(model), iters=args.valid_iters, mixed_prec=args.mixed_precision, args=args)
+                        else:
+                            logging.warning(f"Unknown validation dataset '{ds}', skip validation")
+                            results = {}
+                    logger.write_dict(results)
+                    model.train()
+                    _get_model(model).freeze_bn()
+                    torch.cuda.empty_cache()  # 缓解长时间训练后的显存碎片化 OOM
 
-            if total_steps > args.num_steps:
+            if total_steps >= args.num_steps:
                 should_keep_training = False
                 break
 
@@ -350,6 +451,7 @@ if __name__ == '__main__':
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=8, help="batch size used during training.")
+    parser.add_argument('--accumulate_steps', type=int, default=1, help="gradient accumulation steps (effective_batch = batch_size * accumulate_steps).")
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
@@ -440,6 +542,8 @@ if __name__ == '__main__':
                         help='edge-weighted EPE: upweight edge pixels in L1 loss (0=off, recommended 2~5)')
     parser.add_argument('--edge_aware_smoothness_weight', type=float, default=0.0,
                         help='edge-aware smoothness loss weight (0=off, recommended 0.1~1.0)')
+    parser.add_argument('--freeze_for_edge_finetune', action='store_true',
+                        help='冻结 backbone 和 Stereo 分支，仅微调 edge_head + edge_refine（需 edge_source=shared）')
     args = parser.parse_args()
 
     torch.manual_seed(666)

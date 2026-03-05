@@ -140,10 +140,20 @@ def train(args):
         refine_iters=getattr(args, "refine_iters", 1),
         use_spatial_attn=not getattr(args, "no_spatial_attn", False),
     ))
+
+    # 冻结 backbone，仅微调 EdgeHead + EdgeRefinement
+    if getattr(args, "freeze_for_edge_finetune", False):
+        for p in model.module.backbone.parameters():
+            p.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        logging.info("Freeze backbone for edge finetune: trainable=%d, frozen=%d", trainable, frozen)
+
     logging.info("Parameter Count: %d" % count_parameters(model))
 
     train_loader = fetch_edge_dataloader(args)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+    params_to_optimize = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(params_to_optimize, lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, args.lr, args.num_steps + 100,
         pct_start=0.05, cycle_momentum=False, anneal_strategy="linear"
@@ -160,9 +170,15 @@ def train(args):
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             model.load_state_dict(ckpt["state_dict"], strict=True)
             if "optimizer" in ckpt and ckpt.get("optimizer") is not None:
-                optimizer.load_state_dict(ckpt["optimizer"])
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer"])
+                except (ValueError, KeyError) as e:
+                    logging.warning("Skip loading optimizer (param mismatch, e.g. freeze mode): %s", e)
             if "scheduler" in ckpt and ckpt.get("scheduler") is not None:
-                scheduler.load_state_dict(ckpt["scheduler"])
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                except (ValueError, KeyError) as e:
+                    logging.warning("Skip loading scheduler: %s", e)
             total_steps = ckpt.get("total_steps", 0)
             logging.info("Checkpoint loaded (resumed from step %d).", total_steps)
         else:
@@ -193,7 +209,7 @@ def train(args):
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(params_to_optimize, 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -273,6 +289,8 @@ if __name__ == "__main__":
                         help="关闭 SpatialAttention（加载旧 ckpt 时使用）")
     parser.add_argument("--refine_iters", type=int, default=1,
                         help="Refine 迭代次数，1=单次，2/3=迭代锐化（共享同一 Refine 模块）")
+    parser.add_argument("--freeze_for_edge_finetune", action="store_true",
+                        help="冻结 backbone，仅微调 EdgeHead + EdgeRefinement（用于从预训练 checkpoint 微调边缘头）")
     args = parser.parse_args()
 
     torch.manual_seed(666)

@@ -15,6 +15,7 @@ import cv2
 
 from core.utils import frame_utils
 from core.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
+from gtedge import disp_to_edge
 
 
 class StereoDataset(data.Dataset):
@@ -40,6 +41,17 @@ class StereoDataset(data.Dataset):
         self.disparity_list = []
         self.image_list = []
         self.extra_info = []
+
+    def _get_gtedge_path(self, disp_path):
+        """从 disparity 路径推导 gtedge 文件路径。支持 SceneFlow、KITTI 2012/2015。无映射则返回 None。"""
+        p = disp_path
+        if '/disp_occ_0/' in p:
+            return p.replace('/disp_occ_0/', '/gtedge/')
+        if '/disp_occ/' in p:
+            return p.replace('/disp_occ/', '/gtedge/')
+        if '/disparity/' in p:
+            return p.replace('/disparity/', '/gtedge/').replace('.pfm', '.png')
+        return None
 
     def __getitem__(self, index):
 
@@ -86,58 +98,49 @@ class StereoDataset(data.Dataset):
             img1 = img1[..., :3]
             img2 = img2[..., :3]
 
-        # 加载 GT edge：有文件就加载，供 metrics（epe_edge/epe_flat）使用；模型输入是否用 edge 由 edge_source 决定
-        edge = None
+        # GT edge：优先从预生成文件加载（SceneFlow/KITTI 等），无文件则从 disp 在线计算
         disp_path = self.disparity_list[index]
-        edge_path = disp_path.replace('/disparity/', '/gtedge/').replace('.pfm', '.png')
-        if osp.exists(edge_path):
+        edge_path = self._get_gtedge_path(disp_path)
+        if edge_path is not None and osp.exists(edge_path):
             edge = cv2.imread(edge_path, cv2.IMREAD_GRAYSCALE)
             if edge is not None:
                 edge = edge.astype(np.float32) / 255.0  # [H, W] in [0, 1]
-                h_img, w_img = img1.shape[:2]
-                h_edge, w_edge = edge.shape[:2]
-                if (h_edge, w_edge) != (h_img, w_img):
-                    edge = cv2.resize(edge, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
+            else:
+                edge = None
+        else:
+            edge = None
+        if edge is None:
+            edge_raw = disp_to_edge(disp, grad_thresh=1.0, mode="laplacian")
+            edge = edge_raw.astype(np.float32) / 255.0  # [H, W] in [0, 1]
+        h_img, w_img = img1.shape[:2]
+        h_edge, w_edge = edge.shape[:2]
+        if (h_edge, w_edge) != (h_img, w_img):
+            edge = cv2.resize(edge, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
 
         if self.augmentor is not None:
             if self.sparse:
-                # 传递 edge 给 SparseFlowAugmentor，让它同步应用空间变换
-                if edge is not None:
-                    img1, img2, flow, valid, edge = self.augmentor(img1, img2, flow, valid, edge)
-                else:
-                    img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
+                img1, img2, flow, valid, edge = self.augmentor(img1, img2, flow, valid, edge)
             else:
-                # 传递 edge 给 FlowAugmentor，让它同步应用空间变换（scale/flip/crop）
-                if edge is not None:
-                    img1, img2, flow, edge = self.augmentor(img1, img2, flow, edge)
-                else:
-                    img1, img2, flow = self.augmentor(img1, img2, flow)
+                img1, img2, flow, edge = self.augmentor(img1, img2, flow, edge)
 
-        img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
-        img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
-        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
+        img1 = torch.from_numpy(img1).permute(2, 0, 1).float().clone()
+        img2 = torch.from_numpy(img2).permute(2, 0, 1).float().clone()
+        flow = torch.from_numpy(flow).permute(2, 0, 1).float().clone()
+        edge = torch.from_numpy(edge).unsqueeze(0).float().clone()  # [1, H, W]
 
         if self.sparse:
-            valid = torch.from_numpy(valid)
+            valid = torch.from_numpy(np.ascontiguousarray(valid)).float().clone()
         else:
-            valid = (flow[0].abs() < 512) & (flow[1].abs() < 512)
+            valid = ((flow[0].abs() < 512) & (flow[1].abs() < 512)).float()
 
         if self.img_pad is not None:
             padH, padW = self.img_pad
             img1 = F.pad(img1, [padW]*2 + [padH]*2)
             img2 = F.pad(img2, [padW]*2 + [padH]*2)
-            if edge is not None:
-                edge = F.pad(edge, [padW]*2 + [padH]*2)
+            edge = F.pad(edge, [padW]*2 + [padH]*2)
 
-        flow = flow[:1]
-
-        # 将 edge 转换为 tensor（仅当存在 GT edge 时返回第 6 个元素）
-        if edge is not None:
-            edge = torch.from_numpy(edge).unsqueeze(0).float()  # [1, H, W]
-            return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float(), edge
-
-        # 无 edge 时保持原始返回格式（5 个元素），避免 DataLoader collate 遇到 NoneType
-        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float()
+        flow = flow[:1].clone()  # 避免 slice 导致 storage 不可 resize
+        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid, edge
 
 
     def __mul__(self, v):
@@ -218,7 +221,7 @@ class SceneFlowDatasets(StereoDataset):
 
 
 class ETH3D(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/ETH3D', split='training', edge_source='rcf'):
+    def __init__(self, aug_params=None, root='/home/qi.xiong/StereoMatching/IGEV-Improve/data/eth3d', split='training', edge_source='rcf'):
         super(ETH3D, self).__init__(aug_params, sparse=True, edge_source=edge_source)
 
         image1_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im0.png')) )
@@ -277,16 +280,16 @@ class TartanAir(StereoDataset):
             self.disparity_list += [ disp ]
 
 class KITTI(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/KITTI/KITTI_2015', image_set='training', edge_source='rcf'):
+    def __init__(self, aug_params=None, root='/home/qi.xiong/StereoMatching/IGEV-Improve/data/kitti/kitti_2015', image_set='training', edge_source='rcf'):
         super(KITTI, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispKITTI, edge_source=edge_source)
         assert os.path.exists(root)
 
-        root_12 = '/data/KITTI/KITTI_2012'
+        root_12 = '/home/qi.xiong/StereoMatching/IGEV-Improve/data/kitti/kitti_2012'
         image1_list = sorted(glob(os.path.join(root_12, image_set, 'colored_0/*_10.png')))
         image2_list = sorted(glob(os.path.join(root_12, image_set, 'colored_1/*_10.png')))
         disp_list = sorted(glob(os.path.join(root_12, 'training', 'disp_occ/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ/000085_10.png')]*len(image1_list)
 
-        root_15 = '/data/KITTI/KITTI_2015'
+        root_15 = '/home/qi.xiong/StereoMatching/IGEV-Improve/data/kitti/kitti_2015'
         image1_list += sorted(glob(os.path.join(root_15, image_set, 'image_2/*_10.png')))
         image2_list += sorted(glob(os.path.join(root_15, image_set, 'image_3/*_10.png')))
         disp_list += sorted(glob(os.path.join(root_15, 'training', 'disp_occ_0/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ_0/000085_10.png')]*len(image1_list)
@@ -297,7 +300,7 @@ class KITTI(StereoDataset):
 
 
 class Middlebury(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/Middlebury', split='F', edge_source='rcf'):
+    def __init__(self, aug_params=None, root='/home/qi.xiong/StereoMatching/IGEV-Improve/data/middlebury2014', split='F', edge_source='rcf'):
         super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury, edge_source=edge_source)
         assert os.path.exists(root)
         assert split in "FHQ"
@@ -316,6 +319,17 @@ class Middlebury(StereoDataset):
             self.disparity_list += [ disp ]
 
   
+def _stereo_collate_fn(batch):
+    """自定义 collate，显式 clone 避免 'storage that is not resizable'（sparse 数据集如 ETH3D）"""
+    meta = [b[0] for b in batch]
+    img1 = torch.stack([b[1].contiguous().clone() for b in batch])
+    img2 = torch.stack([b[2].contiguous().clone() for b in batch])
+    flow = torch.stack([b[3].contiguous().clone() for b in batch])
+    valid = torch.stack([b[4].contiguous().clone() for b in batch])
+    edge = torch.stack([b[5].contiguous().clone() for b in batch])
+    return meta, img1, img2, flow, valid, edge
+
+
 def fetch_dataloader(args):
     """ Create the data loader for the corresponding trainign set """
 
@@ -343,6 +357,9 @@ def fetch_dataloader(args):
         elif 'kitti' in dataset_name:
             new_dataset = KITTI(aug_params, edge_source=edge_source)
             logging.info(f"Adding {len(new_dataset)} samples from KITTI")
+        elif dataset_name == 'eth3d':
+            new_dataset = ETH3D(aug_params, split='training', edge_source=edge_source)
+            logging.info(f"Adding {len(new_dataset)} samples from ETH3D")
         elif dataset_name == 'sintel_stereo':
             new_dataset = SintelStereo(aug_params, edge_source=edge_source)*140
             logging.info(f"Adding {len(new_dataset)} samples from Sintel Stereo")
